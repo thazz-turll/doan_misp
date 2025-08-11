@@ -220,9 +220,10 @@ ES_SOURCE_FIELDS = [
 ]
 
 def fetch_iocs_from_es():
-    es = Elasticsearch([ES_URL])
-    # Sử dụng options() để đặt request_timeout và tránh cảnh báo deprecation
+    # ES client: bật nén HTTP, retry khi timeout; set timeout ở options
+    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
     esq = es.options(request_timeout=60)
+
     now = datetime.now(timezone.utc)
     start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
 
@@ -232,97 +233,104 @@ def fetch_iocs_from_es():
         "query": {"range": {"@timestamp": {"gte": start}}}
     }
 
-    page_size = 5000
+    page_size = 3000  # 2000–5000 tuỳ cluster
     search_after = None
-    all_hits = []
+
+    # Dedupe sớm theo (ioc_type, value)
+    seen = set()     # {(type, value)}
+    rows = []        # list(dict) kết quả cuối
+
+    def add_row(ts, src_ip, typ, val):
+        if not typ or not val:
+            return
+        key = (typ, val)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": typ, "value": val})
+
     while True:
         body = dict(base_query)
         body["size"] = page_size
         if search_after:
             body["search_after"] = search_after
-        # Đưa track_total_hits vào body để tránh cảnh báo tham số trùng
         body["track_total_hits"] = False
-        resp = with_retry(
-                  lambda: esq.search(index=ES_INDEX, body=body),
-                  who="es.search"
-              )
+
+        resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search")
         hits = resp.get("hits", {}).get("hits", [])
         if not hits:
             break
-        all_hits.extend(hits)
+
+        for hit in hits:
+            s = hit.get("_source", {}) or {}
+            ts = first(s.get("@timestamp"))
+
+            # IP nguồn
+            src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
+            if src_ip:
+                src_ip = str(src_ip)
+                add_row(ts, src_ip, "ip", src_ip)
+
+            # Credentials
+            u = first(s.get("user.name")) or first(s.get("username"))
+            p = first(s.get("password"))
+            if u or p:
+                cred = f"{u or ''}:{p or ''}"
+                add_row(ts, src_ip, "credential", cred)
+
+            # Hash từ field chuyên dụng
+            for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
+                for val in many(s.get(fld)):
+                    if not val:
+                        continue
+                    v = str(val).strip()
+                    if classify_hash(v):
+                        add_row(ts, src_ip, "hash", v)
+
+            # Hash trong text: gộp 2 field lại rồi quét 1 lần
+            text_buf = []
+            for fld in ["hashes", "message"]:
+                for val in many(s.get(fld)):
+                    if val:
+                        text_buf.append(str(val))
+            if text_buf:
+                merged = "\n".join(text_buf)
+                labeled_found = False
+                for _, h in LABELED_HASH_RE.findall(merged):
+                    if classify_hash(h):
+                        add_row(ts, src_ip, "hash", h)
+                        labeled_found = True
+                if not labeled_found:
+                    for h in BARE_HASH_RE.findall(merged):
+                        if classify_hash(h):
+                            add_row(ts, src_ip, "hash", h)
+
+            # URLs
+            for fld in ["url", "http.url"]:
+                for val in many(s.get(fld)):
+                    if not val:
+                        continue
+                    v = normalize_url(str(val))
+                    if v:
+                        add_row(ts, src_ip, "url", v)
+
+            # Domains / hostnames
+            for fld in ["http.hostname", "domain", "dns.rrname"]:
+                for val in many(s.get(fld)):
+                    if not val:
+                        continue
+                    v = normalize_domain(str(val))
+                    if "." in v and " " not in v:
+                        add_row(ts, src_ip, "domain", v)
+
         search_after = hits[-1]["sort"]
         if len(hits) < page_size:
             break
 
-    ioc_rows = []
-    for hit in all_hits:
-        s = hit.get("_source", {}) or {}
-        ts = first(s.get("@timestamp"))
-
-        # IP nguồn
-        src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
-        if src_ip:
-            src_ip = str(src_ip)
-            ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "ip", "value": src_ip})
-
-        # Credentials
-        u = first(s.get("user.name")) or first(s.get("username"))
-        p = first(s.get("password"))
-        if u or p:
-            cred = f"{u or ''}:{p or ''}"
-            ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "credential", "value": cred})
-
-        # Hash: field chuyên dụng
-        for fld in ["md5","sha1","sha256","sha512","hash"]:
-            for val in many(s.get(fld)):
-                if not val: continue
-                v = str(val).strip()
-                if classify_hash(v):
-                    ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "hash", "value": v})
-
-        # Hash trong text: ưu tiên có nhãn; nếu không có nhãn mới bắt hash trần
-        for fld in ["hashes","message"]:
-            for val in many(s.get(fld)):
-                if not val: continue
-                text = str(val) or ""
-                labeled_found = False
-                for _, h in LABELED_HASH_RE.findall(text):
-                    if classify_hash(h):
-                        ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "hash", "value": h})
-                        labeled_found = True
-                if not labeled_found:
-                    for h in BARE_HASH_RE.findall(text):
-                        if classify_hash(h):
-                            ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "hash", "value": h})
-
-        # URLs
-        for fld in ["url","http.url"]:
-            for val in many(s.get(fld)):
-                if not val: continue
-                v = normalize_url(str(val))
-                if v:
-                    ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "url", "value": v})
-                    
-
-        # Domains / hostnames
-        for fld in ["http.hostname","domain","dns.rrname"]:
-            for val in many(s.get(fld)):
-                if not val: continue
-                v = normalize_domain(str(val))
-                if "." in v and " " not in v:
-                    ioc_rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": "domain", "value": v})
-
-    df = pd.DataFrame(ioc_rows)
-    if df.empty:
-        return df
-    keep_cols = [c for c in ["timestamp","src_ip","ioc_type","value"] if c in df.columns]
-    df = (
-        df[keep_cols]
-        .dropna(subset=["ioc_type","value"])\
-        .drop_duplicates(subset=["ioc_type","value"])\
-        .reset_index(drop=True)
-    )
-    return df
+    # Trả về DataFrame (đã dedupe sớm, không cần drop_duplicates nữa)
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
 
 # ===== MISP mapping / push =====
 
