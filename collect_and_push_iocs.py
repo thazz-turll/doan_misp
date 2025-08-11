@@ -266,13 +266,15 @@ def map_row_to_misp(row):
     ts_str = str(row.get("timestamp", "")).strip()
     ts_local_str = ts_str
     if ts_str:
-        try:
-            # Parse từ dạng ISO (UTC) và đổi sang giờ local của server
-            dt_utc = parser.isoparse(ts_str).replace(tzinfo=timezone.utc)
-            dt_local = dt_utc.astimezone()  # sẽ lấy timezone của server (VN nếu đã set)
-            ts_local_str = dt_local.strftime("%Y-%m-%d %H:%M:%S %Z")
-        except Exception:
-            pass
+              try:
+                  dt = parser.isoparse(ts_str)
+                  # Chỉ gán UTC nếu thiếu thông tin timezone
+                  if dt.tzinfo is None:
+                      dt = dt.replace(tzinfo=timezone.utc)
+                  # Đổi sang giờ local của server
+                  ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+              except Exception:
+                  pass
 
     src = str(row.get("src_ip", "")).strip()
     comment = "; ".join([x for x in [f"src_ip={src}" if src else "", f"ts={ts_local_str}" if ts_local_str else ""] if x])
