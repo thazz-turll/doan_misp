@@ -328,14 +328,13 @@ def create_event(misp: PyMISP, title: str) -> str:
     if not event_id:
         raise RuntimeError(f"Cannot create MISP event, unexpected response: {type(res)} {res}")
 
-    # Gắn tag cho event (nếu có)
     for t in MISP_TAGS:
-        try:
-            misp.tag(event_id, t)
-        except Exception:
-            pass
+    try:
+        misp.tag(event_id, t)
+        logger.info(f"Tagged event {event_id} with {t}")
+    except Exception as e:
+        logger.error(f"Failed to tag event {event_id} with {t}: {e}")
 
-    return event_id
 
 
 def get_event_id(misp: PyMISP):
