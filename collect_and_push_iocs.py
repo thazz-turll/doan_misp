@@ -455,7 +455,7 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
         attr = {"type": misp_type, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
         try:
             def _add():
-            return misp.add_attribute(event_id, attr, pythonify=True)
+                return misp.add_attribute(event_id, attr, pythonify=True)
 
             aobj = with_retry(_add, who="misp.add_attribute")
             added += 1
