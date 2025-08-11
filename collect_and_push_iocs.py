@@ -335,15 +335,15 @@ def map_row_to_misp(row):
     ts_str = str(row.get("timestamp", "")).strip()
     ts_local_str = ts_str
     if ts_str:
-              try:
-                  dt = parser.isoparse(ts_str)
-                  # Chỉ gán UTC nếu thiếu thông tin timezone
-                  if dt.tzinfo is None:
-                      dt = dt.replace(tzinfo=timezone.utc)
-                  # Đổi sang giờ local của server
-                  ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-              except Exception:
-                  pass
+        try:
+            dt = parser.isoparse(ts_str)
+             # Chỉ gán UTC nếu thiếu thông tin timezone
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+             # Đổi sang giờ local của server
+            ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception:
+            pass
 
     src = str(row.get("src_ip", "")).strip()
     comment = "; ".join([x for x in [f"src_ip={src}" if src else "", f"ts={ts_local_str}" if ts_local_str else ""] if x])
@@ -453,6 +453,7 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
             continue
 
         attr = {"type": misp_type, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
+        
         try:
             def _add():
                 return misp.add_attribute(event_id, attr, pythonify=True)
@@ -467,15 +468,16 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
                     logger.info(f"TAG attribute {aobj.uuid} with {PRIVATE_IP_TAG}")
                 except Exception:
                     pass
-         except Exception as e:
+                    
+        except Exception as e:
                msg = str(e).lower()
                if "already exists" in msg or "409" in msg:
                   skipped += 1
                   existing.add(key)
                   logger.info(f"SKIP duplicate (server said exists): {key}")
                else:
-                  skipped += 1
-                  logger.error(f"add_attribute failed: type={misp_type} value={value} err={e}")
+                   skipped += 1
+                   logger.error(f"add_attribute failed: type={misp_type} value={value} err={e}")
 
     return added, skipped
 
