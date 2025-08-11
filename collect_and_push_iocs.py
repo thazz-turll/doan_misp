@@ -40,7 +40,7 @@ if missing:
 
 # Các tham số không nhạy cảm
 ES_INDEX       = os.getenv("ES_INDEX", "logstash-*")
-HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "24"))
+HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "2"))
 
 VERIFY_SSL     = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
 EVENT_MODE     = os.getenv("EVENT_MODE", "DAILY").upper()          # DAILY | APPEND
@@ -131,6 +131,24 @@ def is_non_routable_ip(ip_str: str) -> bool:
 def normalize_domain(d: str) -> str:
     d = str(d or "").strip().lower()
     return d[:-1] if d.endswith(".") else d
+
+def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
+    try:
+        ev = misp.get_event(event_id, pythonify=True)
+        event_uuid = getattr(ev, "uuid", None)
+        if not event_uuid:
+            logger.warning(f"Không lấy được UUID cho event {event_id}, thử gắn theo ID.")
+            event_uuid = event_id  # fallback
+        for t in tags:
+            try:
+                misp.tag(event_uuid, t)  # Ưu tiên UUID
+                logger.info(f"TAG event {event_uuid} with '{t}'")
+            except Exception as e:
+                logger.error(f"Gắn tag '{t}' vào event {event_uuid} thất bại: {e}")
+    except Exception as e:
+        logger.error(f"get_event({event_id}) để gắn tag thất bại: {e}")
+
+
 
 def normalize_url(u: str) -> str:
     u = str(u or "").strip()
@@ -324,18 +342,13 @@ def create_event(misp: PyMISP, title: str) -> str:
     try:
         event_id = res["Event"]["id"]
     except Exception:
-        event_id = getattr(res, "id", None)
+        event_id = getattr(res, "id", None) or getattr(getattr(res, "Event", None), "id", None)
+
     if not event_id:
         raise RuntimeError(f"Cannot create MISP event, unexpected response: {type(res)} {res}")
 
-    # Gắn tag cho event (nếu có)
-    for t in MISP_TAGS:
-        try:
-            misp.tag(event_id, t)
-        except Exception:
-            pass
+    return str(event_id)
 
-    return event_id
 
 
 def get_event_id(misp: PyMISP):
@@ -425,6 +438,10 @@ def main():
     logger.info(f"Using Event ID: {event_id}")
     print(f"[+] Using Event ID: {event_id}")
 
+    # 3.1) Luôn gắn tag cho event (kể cả event đã tồn tại)
+    if MISP_TAGS:
+        tag_event(misp, event_id, MISP_TAGS)
+        
     # 4) Đẩy attribute
     added, skipped = push_iocs_to_misp(misp, event_id, df)
     logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={total}")
