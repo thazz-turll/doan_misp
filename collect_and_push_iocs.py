@@ -339,16 +339,29 @@ def create_event(misp: PyMISP, title: str) -> str:
 
 
 def get_event_id(misp: PyMISP):
+    today_title = f"{EVENT_TITLE_PREFIX} - {datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)}"
+
     if EVENT_MODE == "APPEND":
         if not MISP_EVENT_ID:
             raise ValueError("EVENT_MODE=APPEND nhưng thiếu MISP_EVENT_ID")
-        # Kiểm tra event tồn tại/truy cập được
         ev = misp.get_event(MISP_EVENT_ID)
         if not ev or ("Event" not in ev and not getattr(ev, "id", None)):
             raise ValueError(f"MISP_EVENT_ID={MISP_EVENT_ID} không tồn tại/không truy cập được")
         return MISP_EVENT_ID
-    # DAILY → tạo mới
-    return create_event(misp, create_daily_event_title())
+
+    # DAILY mode → tìm event của hôm nay
+    if EVENT_MODE == "DAILY":
+        try:
+            search_result = misp.search(controller='events', value=today_title, pythonify=True)
+            if search_result:
+                return str(search_result[0].id)
+        except Exception as e:
+            logger.warning(f"Tìm event DAILY bị lỗi: {e}")
+
+        # Không tìm thấy → tạo mới
+        return create_event(misp, today_title)
+
+    raise ValueError(f"EVENT_MODE={EVENT_MODE} không hợp lệ")
 
 
 def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
