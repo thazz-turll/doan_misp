@@ -14,6 +14,9 @@ from dateutil import parser
 import pandas as pd
 from elasticsearch import Elasticsearch
 from pymisp import PyMISP, MISPEvent
+import time, random
+from requests.exceptions import RequestException
+from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -91,7 +94,52 @@ MAPPING_BASE = {
     "credential":("text",   "Other",            False),  # không đẩy sang IDS
 }
 
+RETRY_BASE = float(os.getenv("RETRY_BASE", "0.5"))   # giây
+RETRY_CAP  = float(os.getenv("RETRY_CAP", "8"))      # giây
+RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
+
 # ===== Helpers =====
+
+
+# Xác định lỗi tạm thời (nên retry)
+def _is_retryable_exc(e):
+    # ES errors
+    if isinstance(e, (ESConnectionError, TransportError)):
+        try:
+            status = getattr(e, "status_code", None) or getattr(e, "status", None)
+        except Exception:
+            status = None
+        # retry cho lỗi mạng, 5xx, 429
+        if status in (429, 500, 502, 503, 504) or status is None:
+            return True
+        return False
+
+    # Requests / PyMISP
+    if isinstance(e, RequestException):
+        # đa phần lỗi mạng tạm thời trong nhóm này → retry
+        return True
+
+    # Các Exception khác: cho retry một cách thận trọng
+    return False
+
+def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, who="op"):
+    """
+    Chạy func() với retry/backoff. func có thể raise; nếu hết lượt sẽ re-raise.
+    """
+    attempt = 0
+    while True:
+        try:
+            return func()
+        except Exception as e:
+            attempt += 1
+            if not _is_retryable_exc(e) or attempt >= max_attempts:
+                logger.error(f"[{who}] FAILED after {attempt} attempts: {e}")
+                raise
+            delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, base)
+            logger.warning(f"[{who}] attempt {attempt} failed: {e} → retry in {delay:.2f}s")
+            time.sleep(delay)
+
+
 def first(v):
     if isinstance(v, list) and v:
         return v[0]
@@ -134,14 +182,14 @@ def normalize_domain(d: str) -> str:
 
 def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
     try:
-        ev = misp.get_event(event_id, pythonify=True)
+        ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_tag")
         event_uuid = getattr(ev, "uuid", None)
         if not event_uuid:
             logger.warning(f"Không lấy được UUID cho event {event_id}, thử gắn theo ID.")
             event_uuid = event_id  # fallback
         for t in tags:
             try:
-                misp.tag(event_uuid, t)  # Ưu tiên UUID
+                with_retry(lambda: misp.tag(event_uuid, t), who="misp.tag_event")
                 logger.info(f"TAG event {event_uuid} with '{t}'")
             except Exception as e:
                 logger.error(f"Gắn tag '{t}' vào event {event_uuid} thất bại: {e}")
@@ -194,7 +242,10 @@ def fetch_iocs_from_es():
             body["search_after"] = search_after
         # Đưa track_total_hits vào body để tránh cảnh báo tham số trùng
         body["track_total_hits"] = False
-        resp = esq.search(index=ES_INDEX, body=body)
+        resp = with_retry(
+                  lambda: esq.search(index=ES_INDEX, body=body),
+                  who="es.search"
+              )
         hits = resp.get("hits", {}).get("hits", [])
         if not hits:
             break
@@ -335,7 +386,7 @@ def create_event(misp: PyMISP, title: str) -> str:
     ev.analysis        = EVENT_ANALYSIS
     ev.threat_level_id = THREAT_LEVEL_ID
 
-    res = misp.add_event(ev)
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event")
 
     # Lấy event_id đúng cách
     event_id = None
@@ -357,7 +408,7 @@ def get_event_id(misp: PyMISP):
     if EVENT_MODE == "APPEND":
         if not MISP_EVENT_ID:
             raise ValueError("EVENT_MODE=APPEND nhưng thiếu MISP_EVENT_ID")
-        ev = misp.get_event(MISP_EVENT_ID)
+        ev = with_retry(lambda: misp.get_event(MISP_EVENT_ID), who="misp.get_event")
         if not ev or ("Event" not in ev and not getattr(ev, "id", None)):
             raise ValueError(f"MISP_EVENT_ID={MISP_EVENT_ID} không tồn tại/không truy cập được")
         return MISP_EVENT_ID
@@ -365,7 +416,10 @@ def get_event_id(misp: PyMISP):
     # DAILY mode → tìm event của hôm nay
     if EVENT_MODE == "DAILY":
         try:
-            search_result = misp.search(controller='events', value=today_title, pythonify=True)
+            search_result = with_retry(
+                lambda: misp.search(controller='events', value=today_title, pythonify=True),
+                who="misp.search_event"
+                        )
             if search_result:
                 return str(search_result[0].id)
         except Exception as e:
@@ -380,7 +434,7 @@ def get_event_id(misp: PyMISP):
 def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
     existing = set()
     try:
-        ev = misp.get_event(event_id, pythonify=True)
+        ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_attrs")
         for a in getattr(ev, "attributes", []) or []:
             existing.add((a.type, a.value))
     except Exception as e:
@@ -400,19 +454,28 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
 
         attr = {"type": misp_type, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
         try:
-            aobj = misp.add_attribute(event_id, attr, pythonify=True)
+            def _add():
+            return misp.add_attribute(event_id, attr, pythonify=True)
+
+            aobj = with_retry(_add, who="misp.add_attribute")
             added += 1
             existing.add(key)
             logger.info(f"ADD {misp_type} value={value} to_ids={to_ids} comment='{comment}'")
             if TAG_PRIVATE_IP_ATTR and is_private and getattr(aobj, "uuid", None):
                 try:
-                    misp.tag(aobj.uuid, PRIVATE_IP_TAG)
+                    with_retry(lambda: misp.tag(aobj.uuid, PRIVATE_IP_TAG), who="misp.tag_attr")
                     logger.info(f"TAG attribute {aobj.uuid} with {PRIVATE_IP_TAG}")
                 except Exception:
                     pass
-        except Exception as e:
-            skipped += 1
-            logger.error(f"add_attribute failed: type={misp_type} value={value} err={e}")
+         except Exception as e:
+               msg = str(e).lower()
+               if "already exists" in msg or "409" in msg:
+                  skipped += 1
+                  existing.add(key)
+                  logger.info(f"SKIP duplicate (server said exists): {key}")
+               else:
+                  skipped += 1
+                  logger.error(f"add_attribute failed: type={misp_type} value={value} err={e}")
 
     return added, skipped
 
