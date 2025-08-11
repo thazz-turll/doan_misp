@@ -413,15 +413,29 @@ def get_event_id(misp: PyMISP):
             raise ValueError(f"MISP_EVENT_ID={MISP_EVENT_ID} không tồn tại/không truy cập được")
         return MISP_EVENT_ID
 
-    # DAILY mode → tìm event của hôm nay
     if EVENT_MODE == "DAILY":
         try:
+            # ✅ Tìm theo tiêu đề Event (eventinfo), metadata nhanh hơn
+            # Cách 1: dùng search_index (nhanh)
+            idx = with_retry(
+                lambda: misp.search_index(eventinfo=today_title), 
+                who="misp.search_index_event"
+            )
+            # idx là list dict; lọc đúng tiêu đề
+            for it in idx or []:
+                if it.get('info') == today_title:
+                    return str(it.get('id'))
+
+            # Cách 2 (fallback): search controller='events' + eventinfo, pythonify=True
             search_result = with_retry(
-                lambda: misp.search(controller='events', value=today_title, pythonify=True),
-                who="misp.search_event"
-                        )
+                lambda: misp.search(controller='events', eventinfo=today_title, metadata=True, pythonify=True),
+                who="misp.search_event_by_eventinfo"
+            )
             if search_result:
-                return str(search_result[0].id)
+                # Lọc đúng info (tránh match mơ hồ)
+                for ev in search_result:
+                    if getattr(ev, "info", "") == today_title:
+                        return str(ev.id)
         except Exception as e:
             logger.warning(f"Tìm event DAILY bị lỗi: {e}")
 
@@ -429,6 +443,7 @@ def get_event_id(misp: PyMISP):
         return create_event(misp, today_title)
 
     raise ValueError(f"EVENT_MODE={EVENT_MODE} không hợp lệ")
+
 
 
 def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
