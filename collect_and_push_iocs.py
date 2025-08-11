@@ -328,14 +328,7 @@ def create_event(misp: PyMISP, title: str) -> str:
     if not event_id:
         raise RuntimeError(f"Cannot create MISP event, unexpected response: {type(res)} {res}")
 
-    for t in MISP_TAGS:
-        try:
-            misp.tag(event_id, t)
-            logger.info(f"Tagged event {event_id} with {t}")
-        except Exception as e:
-            logger.error(f"Failed to tag event {event_id} with {t}: {e}")
-
-
+  
 
 def get_event_id(misp: PyMISP):
     today_title = f"{EVENT_TITLE_PREFIX} - {datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)}"
