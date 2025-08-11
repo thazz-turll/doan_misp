@@ -49,7 +49,7 @@ MISP_EVENT_ID  = os.getenv("MISP_EVENT_ID")                        # cần khi A
 EVENT_DISTRIBUTION = int(os.getenv("MISP_DISTRIBUTION", "0"))
 EVENT_ANALYSIS     = int(os.getenv("MISP_ANALYSIS", "0"))
 THREAT_LEVEL_ID    = int(os.getenv("MISP_THREAT_LEVEL_ID", "2"))
-MISP_TAGS          = [t.strip() for t in os.getenv("MISP_TAGS", "source:t-pot").split(",") if t.strip()]
+MISP_TAGS          = [t.strip() for t in os.getenv("MISP_TAGS", "source:t-pot,tlp:amber").split(",") if t.strip()]
 
 DISABLE_IDS_FOR_PRIVATE = os.getenv("DISABLE_IDS_FOR_PRIVATE_IP", "true").lower() == "true"
 TAG_PRIVATE_IP_ATTR     = os.getenv("TAG_PRIVATE_IP_ATTR", "false").lower() == "true"
@@ -328,7 +328,15 @@ def create_event(misp: PyMISP, title: str) -> str:
     if not event_id:
         raise RuntimeError(f"Cannot create MISP event, unexpected response: {type(res)} {res}")
 
-  
+    # Gắn tag cho event (nếu có)
+    for t in MISP_TAGS:
+        try:
+            misp.tag(event_id, t)
+        except Exception:
+            pass
+
+    return event_id
+
 
 def get_event_id(misp: PyMISP):
     today_title = f"{EVENT_TITLE_PREFIX} - {datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)}"
