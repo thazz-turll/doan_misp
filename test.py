@@ -38,7 +38,7 @@ ES_INDEX         = os.getenv("ES_INDEX", "logstash-*")
 HOURS_LOOKBACK   = int(os.getenv("HOURS_LOOKBACK", "2"))
 
 MISP_URL         = os.getenv("MISP_URL", "https://192.168.1.101/")
-MISP_KEY         = os.getenv("MISP_KEY", "REPLACE_ME")
+MISP_KEY         = os.getenv("MISP_KEY", "hW0DZztasm17mclsC4lkkPgFq6n8JY4ohKRPk4v5")
 VERIFY_SSL       = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
 
 EVENT_MODE       = os.getenv("EVENT_MODE", "DAILY").upper()   # DAILY | APPEND
