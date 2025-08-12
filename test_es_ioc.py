@@ -16,7 +16,7 @@ from elasticsearch import Elasticsearch
 import pandas as pd
 
 # ==== ENV (giữ tối giản, không hardcode URL) ====
-ES_URL   = os.getenv("ES_URL")                # ví dụ: https://user:pass@es.example:9200
+ES_URL   = os.getenv("http://192.168.1.100:64298")                # ví dụ: https://user:pass@es.example:9200
 ES_INDEX = os.getenv("ES_INDEX", "logstash-*")
 HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "2"))  # lấy dữ liệu 2 giờ gần nhất
 
