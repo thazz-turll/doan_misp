@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Test: Kết nối Elasticsearch, query IoC theo timeframe, xử lý lọc trùng.
-Tự load .env và có fallback giá trị mặc định để chạy nhanh.
+Test: Kết nối Elasticsearch, truy vấn IoC theo timeframe, xử lý lọc trùng, có phân trang.
+Bao gồm đủ IoC: ip, domain, url, hash (md5/sha1/sha256/sha512), credential (username/password).
 """
 
 import os
@@ -11,7 +11,7 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import re
 import ipaddress
-from elasticsearch import Elasticsearch
+from elasticsearch import Elasticsearch, TransportError, ConnectionError as ESConnectionError
 import pandas as pd
 
 # ===== Load .env nếu có =====
@@ -34,9 +34,13 @@ if not ES_URL.strip():
 # ==== Field nguồn cần lấy từ ES ====
 ES_SOURCE_FIELDS = [
     "@timestamp",
+    # IP/credential
     "source.ip", "src_ip",
+    "user.name", "username", "password",
+    # Domain/URL
     "http.hostname", "domain", "dns.rrname",
     "url", "http.url",
+    # Hash + text
     "md5", "sha1", "sha256", "sha512", "hash", "hashes", "message"
 ]
 
@@ -88,20 +92,27 @@ def _many(v):
         return v
     return [v] if v is not None else []
 
+def _is_retryable_exc(e) -> bool:
+    if isinstance(e, (ESConnectionError, TransportError)):
+        status = getattr(e, "status_code", None) or getattr(e, "status", None)
+        if status in (429, 500, 502, 503, 504) or status is None:
+            return True
+        return False
+    return False
+
 def fetch_iocs_from_es(es: Elasticsearch) -> pd.DataFrame:
     now = datetime.now(timezone.utc)
     start = (now - timedelta(hours=HOURS_LOOKBACK)).isoformat()
 
-    body = {
+    base_query = {
         "_source": ES_SOURCE_FIELDS,
         "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
         "query": {"range": {"@timestamp": {"gte": start}}},
-        "size": 3000,
         "track_total_hits": False
     }
 
-    resp = es.search(index=ES_INDEX, body=body, request_timeout=60)
-    hits = resp.get("hits", {}).get("hits", []) or []
+    page_size = 3000
+    search_after = None
 
     rows = []
     dedupe = set()
@@ -115,48 +126,81 @@ def fetch_iocs_from_es(es: Elasticsearch) -> pd.DataFrame:
         dedupe.add(key)
         rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": ioc_type, "value": value})
 
-    for h in hits:
-        s = h.get("_source", {}) or {}
-        ts = _first(s.get("@timestamp"))
-        src_ip = _first(s.get("source.ip")) or _first(s.get("src_ip"))
+    while True:
+        body = dict(base_query)
+        body["size"] = page_size
+        if search_after is not None:
+            body["search_after"] = search_after
 
-        if src_ip:
-            add("ip", str(src_ip), ts, src_ip)
+        # 1 lần retry nhẹ nếu lỗi mạng/5xx
+        try:
+            resp = es.search(index=ES_INDEX, body=body, request_timeout=60)
+        except Exception as e:
+            if _is_retryable_exc(e):
+                resp = es.search(index=ES_INDEX, body=body, request_timeout=60)
+            else:
+                raise
 
-        for fld in ["http.hostname", "domain", "dns.rrname"]:
-            for v in _many(s.get(fld)):
-                v = normalize_domain(str(v))
-                if v and "." in v and " " not in v:
-                    add("domain", v, ts, src_ip)
+        hits = resp.get("hits", {}).get("hits", []) or []
+        if not hits:
+            break
 
-        for fld in ["url", "http.url"]:
-            for v in _many(s.get(fld)):
-                v = normalize_url(str(v))
-                if v:
-                    add("url", v, ts, src_ip)
+        for h in hits:
+            s = h.get("_source", {}) or {}
+            ts = _first(s.get("@timestamp"))
+            src_ip = _first(s.get("source.ip")) or _first(s.get("src_ip"))
+            if src_ip:
+                add("ip", str(src_ip), ts, src_ip)
 
-        for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
-            for v in _many(s.get(fld)):
-                v = str(v).strip()
-                if classify_hash(v):
-                    add("hash", v, ts, src_ip)
+            # Credentials (username/password)
+            u = _first(s.get("user.name")) or _first(s.get("username"))
+            p = _first(s.get("password"))
+            if u or p:
+                cred = f"{u or ''}:{p or ''}"
+                add("credential", cred, ts, src_ip)
 
-        text_buf = []
-        for fld in ["hashes", "message"]:
-            for v in _many(s.get(fld)):
-                if v:
-                    text_buf.append(str(v))
-        if text_buf:
-            merged = "\n".join(text_buf)
-            labeled = False
-            for _, hx in LABELED_HASH_RE.findall(merged):
-                if classify_hash(hx):
-                    add("hash", hx, ts, src_ip)
-                    labeled = True
-            if not labeled:
-                for hx in BARE_HASH_RE.findall(merged):
+            # Domains
+            for fld in ["http.hostname", "domain", "dns.rrname"]:
+                for v in _many(s.get(fld)):
+                    v = normalize_domain(str(v))
+                    if v and "." in v and " " not in v:
+                        add("domain", v, ts, src_ip)
+
+            # URLs
+            for fld in ["url", "http.url"]:
+                for v in _many(s.get(fld)):
+                    v = normalize_url(str(v))
+                    if v:
+                        add("url", v, ts, src_ip)
+
+            # Hash từ field chuyên dụng
+            for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
+                for v in _many(s.get(fld)):
+                    v = str(v).strip()
+                    if classify_hash(v):
+                        add("hash", v, ts, src_ip)
+
+            # Hash trong text
+            text_buf = []
+            for fld in ["hashes", "message"]:
+                for v in _many(s.get(fld)):
+                    if v:
+                        text_buf.append(str(v))
+            if text_buf:
+                merged = "\n".join(text_buf)
+                labeled = False
+                for _, hx in LABELED_HASH_RE.findall(merged):
                     if classify_hash(hx):
                         add("hash", hx, ts, src_ip)
+                        labeled = True
+                if not labeled:
+                    for hx in BARE_HASH_RE.findall(merged):
+                        if classify_hash(hx):
+                            add("hash", hx, ts, src_ip)
+
+        search_after = hits[-1]["sort"]
+        if len(hits) < page_size:
+            break
 
     return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
 
@@ -168,7 +212,10 @@ def main():
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
         return
 
+    # Thống kê nhanh theo loại IoC
+    counts = df["ioc_type"].value_counts().to_dict()
     print(f"[+] Tổng IoC (sau lọc trùng): {len(df)}")
+    print("[+] Phân bố loại IoC:", counts)
     print(df.head(10).to_string(index=False))
 
 if __name__ == "__main__":
