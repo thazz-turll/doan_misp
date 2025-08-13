@@ -212,13 +212,17 @@ def main():
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
         return
 
-    # Thống kê nhanh
+    # Sắp xếp mới nhất lên đầu để khi in/ghi dễ xem
+    df = df.sort_values(by="timestamp", ascending=False, na_position="last")
+
+    # In thông tin chính ra terminal (giữ như ban đầu)
     counts = df["ioc_type"].value_counts().to_dict()
     print(f"[+] Tổng IoC (sau lọc trùng): {len(df)}")
     print("[+] Phân bố loại IoC:", counts)
     print(df.head(10).to_string(index=False))
 
-    # --- Ghi CSV cố định ---
+    # Ghi CSV cố định (ghi đè)
     out_file = "latest_iocs.csv"
     df.to_csv(out_file, index=False, encoding="utf-8")
     print(f"[+] Đã lưu IoC vào: {out_file}")
+
