@@ -3,6 +3,7 @@
 """
 Test: Kết nối Elasticsearch, truy vấn IoC theo timeframe, xử lý lọc trùng, có phân trang.
 Bao gồm đủ IoC: ip, domain, url, hash (md5/sha1/sha256/sha512), credential (username/password).
+In thống kê + top 10 ra terminal và ghi CSV cố định latest_iocs.csv.
 """
 
 import os
@@ -198,7 +199,13 @@ def fetch_iocs_from_es(es: Elasticsearch) -> pd.DataFrame:
                         if classify_hash(hx):
                             add("hash", hx, ts, src_ip)
 
-        search_after = hits[-1]["sort"]
+        # an toàn khi lấy khóa sort
+        last = hits[-1]
+        if "sort" in last:
+            search_after = last["sort"]
+        else:
+            break
+
         if len(hits) < page_size:
             break
 
@@ -212,17 +219,19 @@ def main():
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
         return
 
-    # Sắp xếp mới nhất lên đầu để khi in/ghi dễ xem
+    # Sắp xếp mới nhất lên đầu (dễ xem)
     df = df.sort_values(by="timestamp", ascending=False, na_position="last")
 
-    # In thông tin chính ra terminal (giữ như ban đầu)
+    # In thông tin chính ra terminal
     counts = df["ioc_type"].value_counts().to_dict()
     print(f"[+] Tổng IoC (sau lọc trùng): {len(df)}")
     print("[+] Phân bố loại IoC:", counts)
     print(df.head(10).to_string(index=False))
 
-    # Ghi CSV cố định (ghi đè)
+    # Ghi CSV cố định (ghi đè ngay cạnh script)
     out_file = "latest_iocs.csv"
     df.to_csv(out_file, index=False, encoding="utf-8")
     print(f"[+] Đã lưu IoC vào: {out_file}")
 
+if __name__ == "__main__":
+    main()
