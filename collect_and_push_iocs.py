@@ -86,6 +86,12 @@ BARE_HASH_RE = re.compile(
 )
 URL_RE          = re.compile(r"\bhttps?://[^\s\"']{4,}\b", re.IGNORECASE)
 
+DOMAIN_RE = re.compile(
+    r"\b(?=.{1,253}\b)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b",
+    re.IGNORECASE
+)
+
+
 # Map base (non-hash)
 MAPPING_BASE = {
     "ip":        ("ip-src", "Network activity", True),   # to_ids có thể bị override nếu là private
@@ -210,17 +216,19 @@ def normalize_url(u: str) -> str:
 # ===== ES fetch (ip/domain/url/hash/credential) =====
 ES_SOURCE_FIELDS = [
     "@timestamp",
-    # IP/username/password
-    "source.ip", "src_ip",
-    "user.name", "username", "password",
-    # Hash fields & text
+    "source.ip","src_ip",
+    "user.name","username","password",
     "md5","sha1","sha256","sha512","hash","hashes","message",
-    # URL/Domain
-    "url","http.url","http.hostname","domain","dns.rrname"
+
+    # URL & domain (bao phủ phổ biến)
+    "url","http.url","url.full","url.original","url.domain",
+    "http.hostname","hostname","domain",
+    "dns.rrname","dns.question.name",
 ]
 
+
 def fetch_iocs_from_es():
-    # ES client: bật nén HTTP, retry khi timeout; set timeout ở options
+    # ES client
     es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
     esq = es.options(request_timeout=60)
 
@@ -233,12 +241,11 @@ def fetch_iocs_from_es():
         "query": {"range": {"@timestamp": {"gte": start}}}
     }
 
-    page_size = 3000  # 2000–5000 tuỳ cluster
+    page_size = 3000
     search_after = None
 
-    # Dedupe sớm theo (ioc_type, value)
-    seen = set()     # {(type, value)}
-    rows = []        # list(dict) kết quả cuối
+    seen = set()
+    rows = []
 
     def add_row(ts, src_ip, typ, val):
         if not typ or not val:
@@ -287,7 +294,7 @@ def fetch_iocs_from_es():
                     if classify_hash(v):
                         add_row(ts, src_ip, "hash", v)
 
-            # Hash trong text: gộp 2 field lại rồi quét 1 lần
+            # Hash trong text
             text_buf = []
             for fld in ["hashes", "message"]:
                 for val in many(s.get(fld)):
@@ -305,29 +312,54 @@ def fetch_iocs_from_es():
                         if classify_hash(h):
                             add_row(ts, src_ip, "hash", h)
 
-            # URLs
-            for fld in ["url", "http.url"]:
+            # ===== URLs từ field cấu trúc =====
+            for fld in ["url.full", "url.original", "http.url", "url"]:
                 for val in many(s.get(fld)):
                     if not val:
                         continue
                     v = normalize_url(str(val))
-                    if v:
+                    if v and v.lower().startswith(("http://", "https://")):
                         add_row(ts, src_ip, "url", v)
 
-            # Domains / hostnames
-            for fld in ["http.hostname", "domain", "dns.rrname"]:
+            # Nếu chỉ có host → tự ghép http://host
+            host = first(s.get("url.domain")) or first(s.get("http.hostname")) \
+                   or first(s.get("hostname")) or first(s.get("domain"))
+            if host:
+                h = normalize_domain(str(host))
+                if h:
+                    add_row(ts, src_ip, "url", f"http://{h}")
+
+            # ===== URLs trong message (regex http/https) =====
+            for val in many(s.get("message")):
+                if not val:
+                    continue
+                for m in URL_RE.findall(str(val)):
+                    v = normalize_url(m)
+                    if v and v.lower().startswith(("http://", "https://")):
+                        add_row(ts, src_ip, "url", v)
+
+            # ===== Domains từ field cấu trúc =====
+            for fld in ["http.hostname", "hostname", "domain", "url.domain", "dns.rrname", "dns.question.name"]:
                 for val in many(s.get(fld)):
                     if not val:
                         continue
-                    v = normalize_domain(str(val))
-                    if "." in v and " " not in v:
-                        add_row(ts, src_ip, "domain", v)
+                    d = normalize_domain(str(val))
+                    if "." in d and " " not in d:
+                        add_row(ts, src_ip, "domain", d)
+
+            # ===== Domains trong message =====
+            for val in many(s.get("message")):
+                if not val:
+                    continue
+                for d in DOMAIN_RE.findall(str(val)):
+                    d2 = normalize_domain(d)
+                    if d2 and "." in d2 and " " not in d2:
+                        add_row(ts, src_ip, "domain", d2)
 
         search_after = hits[-1]["sort"]
         if len(hits) < page_size:
             break
 
-    # Trả về DataFrame (đã dedupe sớm, không cần drop_duplicates nữa)
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
