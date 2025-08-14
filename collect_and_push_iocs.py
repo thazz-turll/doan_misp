@@ -96,6 +96,7 @@ DOMAIN_RE = re.compile(
 MAPPING_BASE = {
     "ip":        ("ip-src", "Network activity", True),   # to_ids có thể bị override nếu là private
     "domain":    ("domain", "Network activity", True),
+    "hostname":  ("hostname", "Network activity", True),
     "url":       ("url",    "Network activity", True),
     "credential":("text",   "Other",            False),  # không đẩy sang IDS
 }
@@ -223,7 +224,6 @@ ES_SOURCE_FIELDS = [
     # URL & domain (bao phủ phổ biến)
     "url","http.url","url.full","url.original","url.domain",
     "http.hostname","hostname","domain",
-    "dns.rrname","dns.question.name",
 ]
 
 
@@ -244,8 +244,9 @@ def fetch_iocs_from_es():
     page_size = 3000
     search_after = None
 
-    seen = set()
-    rows = []
+    # Dedupe sớm theo (ioc_type, value)
+    seen = set()    # {(type, value)}
+    rows = []       # list[dict]
 
     def add_row(ts, src_ip, typ, val):
         if not typ or not val:
@@ -272,20 +273,20 @@ def fetch_iocs_from_es():
             s = hit.get("_source", {}) or {}
             ts = first(s.get("@timestamp"))
 
-            # IP nguồn
+            # 1) IP nguồn
             src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
             if src_ip:
                 src_ip = str(src_ip)
                 add_row(ts, src_ip, "ip", src_ip)
 
-            # Credentials
+            # 2) Credentials (nếu có)
             u = first(s.get("user.name")) or first(s.get("username"))
             p = first(s.get("password"))
             if u or p:
                 cred = f"{u or ''}:{p or ''}"
                 add_row(ts, src_ip, "credential", cred)
 
-            # Hash từ field chuyên dụng
+            # 3) Hash từ field chuyên dụng
             for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
                 for val in many(s.get(fld)):
                     if not val:
@@ -294,7 +295,7 @@ def fetch_iocs_from_es():
                     if classify_hash(v):
                         add_row(ts, src_ip, "hash", v)
 
-            # Hash trong text
+            # 3b) Hash trong text (hashes, message)
             text_buf = []
             for fld in ["hashes", "message"]:
                 for val in many(s.get(fld)):
@@ -312,7 +313,7 @@ def fetch_iocs_from_es():
                         if classify_hash(h):
                             add_row(ts, src_ip, "hash", h)
 
-            # ===== URLs từ field cấu trúc =====
+            # 4) URL từ field có cấu trúc
             for fld in ["url.full", "url.original", "http.url", "url"]:
                 for val in many(s.get(fld)):
                     if not val:
@@ -321,15 +322,15 @@ def fetch_iocs_from_es():
                     if v and v.lower().startswith(("http://", "https://")):
                         add_row(ts, src_ip, "url", v)
 
-            # Nếu chỉ có host → tự ghép http://host
+            # 4b) Nếu chỉ có host → ghép http://host thành URL tối thiểu
             host = first(s.get("url.domain")) or first(s.get("http.hostname")) \
-                   or first(s.get("hostname")) or first(s.get("domain"))
+                   or first(s.get("hostname"))   or first(s.get("domain"))
             if host:
                 h = normalize_domain(str(host))
-                if h:
+                if h and "." in h and " " not in h:
                     add_row(ts, src_ip, "url", f"http://{h}")
 
-            # ===== URLs trong message (regex http/https) =====
+            # 4c) URL trong message (regex http/https)
             for val in many(s.get("message")):
                 if not val:
                     continue
@@ -338,8 +339,17 @@ def fetch_iocs_from_es():
                     if v and v.lower().startswith(("http://", "https://")):
                         add_row(ts, src_ip, "url", v)
 
-            # ===== Domains từ field cấu trúc =====
-            for fld in ["http.hostname", "hostname", "domain", "url.domain", "dns.rrname", "dns.question.name"]:
+            # 5) HOSTNAME từ field có cấu trúc
+            for fld in ["http.hostname", "hostname"]:
+                for val in many(s.get(fld)):
+                    if not val:
+                        continue
+                    h = normalize_domain(str(val))
+                    if "." in h and " " not in h:
+                        add_row(ts, src_ip, "hostname", h)
+
+            # 6) DOMAIN từ field có cấu trúc
+            for fld in ["domain", "url.domain"]:
                 for val in many(s.get(fld)):
                     if not val:
                         continue
@@ -347,14 +357,18 @@ def fetch_iocs_from_es():
                     if "." in d and " " not in d:
                         add_row(ts, src_ip, "domain", d)
 
-            # ===== Domains trong message =====
+            # 7) Hostname/Domain phát hiện trong message (regex)
             for val in many(s.get("message")):
                 if not val:
                     continue
                 for d in DOMAIN_RE.findall(str(val)):
                     d2 = normalize_domain(d)
                     if d2 and "." in d2 and " " not in d2:
-                        add_row(ts, src_ip, "domain", d2)
+                        # Heuristic: >=3 label → hostname, =2 label → domain
+                        if d2.count(".") >= 2:
+                            add_row(ts, src_ip, "hostname", d2)
+                        else:
+                            add_row(ts, src_ip, "domain", d2)
 
         search_after = hits[-1]["sort"]
         if len(hits) < page_size:
@@ -363,6 +377,7 @@ def fetch_iocs_from_es():
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
+
 
 # ===== MISP mapping / push =====
 
@@ -377,40 +392,50 @@ def map_row_to_misp(row):
     if ts_str:
         try:
             dt = parser.isoparse(ts_str)
-             # Chỉ gán UTC nếu thiếu thông tin timezone
+            # Chỉ gán UTC nếu thiếu thông tin timezone
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-             # Đổi sang giờ local của server
+            # Đổi sang giờ local của server
             ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
         except Exception:
             pass
 
     src = str(row.get("src_ip", "")).strip()
-    comment = "; ".join([x for x in [f"src_ip={src}" if src else "", f"ts={ts_local_str}" if ts_local_str else ""] if x])
+    comment_parts = []
+    if src:
+        comment_parts.append(f"src_ip={src}")
+    if ts_local_str:
+        comment_parts.append(f"ts={ts_local_str}")
+    comment = "; ".join(comment_parts)
 
-
+    # Hash
     if ioc_type == "hash":
         htype = classify_hash(value)
         if not htype:
             return None
         return (htype, "Payload delivery", True, value, comment, False)
 
-    if ioc_type == "ip":
+    # IP
+    elif ioc_type == "ip":
         is_private = is_non_routable_ip(value)
         to_ids = not (DISABLE_IDS_FOR_PRIVATE and is_private)
         if is_private:
             comment = (comment + "; non-routable") if comment else "non-routable"
         return ("ip-src", "Network activity", to_ids, value, comment, is_private)
 
-    if ioc_type in ("domain", "url"):
+    # Domain / URL / Hostname
+    elif ioc_type in ("domain", "url", "hostname"):
         misp_type, category, to_ids = MAPPING_BASE[ioc_type]
         return (misp_type, category, to_ids, value, comment, False)
 
-    if ioc_type == "credential":
+    # Credential
+    elif ioc_type == "credential":
         misp_type, category, to_ids = MAPPING_BASE[ioc_type]
         return (misp_type, category, to_ids, value, comment, False)
 
-    return None
+    else:
+        return None
+
 
 
 def create_daily_event_title():
