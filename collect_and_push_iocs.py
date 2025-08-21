@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 import os
 import re
 import sys
@@ -21,6 +22,7 @@ import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ===== .env =====
+# Load biến môi trường (nếu có .env)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -28,6 +30,7 @@ except Exception:
     pass
 
 # ===== CONFIG (bắt buộc từ ENV, không hardcode URL) =====
+# Đọc cấu hình chính từ ENV
 ES_URL = os.getenv("ES_URL")                # bắt buộc
 MISP_URL = os.getenv("MISP_URL")            # bắt buộc
 MISP_KEY = os.getenv("MISP_KEY")            # bắt buộc
@@ -64,6 +67,7 @@ LOG_MAX_BYTES  = int(os.getenv("LOG_MAX_BYTES", "1048576"))  # 1MB
 LOG_BACKUPS    = int(os.getenv("LOG_BACKUPS", "3"))
 
 # ===== Logger =====
+# Khởi tạo logger xoay vòng file
 logger = logging.getLogger("ioc-es-misp-v3")
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
@@ -71,6 +75,7 @@ handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)
 logger.addHandler(handler)
 
 # ===== Regex/hash/url =====
+# Regex nhận diện hash/URL/domain trong log
 MD5_RE    = re.compile(r"^[a-fA-F0-9]{32}$")
 SHA1_RE   = re.compile(r"^[a-fA-F0-9]{40}$")
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
@@ -108,8 +113,8 @@ RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
 # ===== Helpers =====
 
 
-# Xác định lỗi tạm thời (nên retry)
 def _is_retryable_exc(e):
+    """Xác định lỗi tạm thời (nên retry)."""
     # ES errors
     if isinstance(e, (ESConnectionError, TransportError)):
         try:
@@ -129,10 +134,9 @@ def _is_retryable_exc(e):
     # Các Exception khác: cho retry một cách thận trọng
     return False
 
+
 def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, who="op"):
-    """
-    Chạy func() với retry/backoff. func có thể raise; nếu hết lượt sẽ re-raise.
-    """
+    """Chạy func() với exponential backoff/retry cho lỗi tạm thời."""
     attempt = 0
     while True:
         try:
@@ -148,16 +152,21 @@ def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, 
 
 
 def first(v):
+    """Lấy phần tử đầu nếu v là list, ngược lại trả về v."""
     if isinstance(v, list) and v:
         return v[0]
     return v
 
+
 def many(v):
+    """Đảm bảo giá trị là list (bọc đơn thành list)."""
     if isinstance(v, list):
         return v
     return [v] if v is not None else []
 
+
 def classify_hash(h: str):
+    """Phân loại hash theo độ dài: md5/sha1/sha256/sha512, không khớp → None."""
     if not isinstance(h, str):
         return None
     v = h.strip()
@@ -167,7 +176,9 @@ def classify_hash(h: str):
     if SHA512_RE.fullmatch(v): return "sha512"
     return None
 
+
 def is_non_routable_ip(ip_str: str) -> bool:
+    """Kiểm tra IP có phải non-routable/private/loopback..."""
     try:
         ip_obj = ipaddress.ip_address(ip_str)
     except Exception:
@@ -183,11 +194,15 @@ def is_non_routable_ip(ip_str: str) -> bool:
         or getattr(ip_obj, "is_global", None) is False
     )
 
+
 def normalize_domain(d: str) -> str:
+    """Chuẩn hóa domain/hostname (lower, bỏ dấu chấm cuối)."""
     d = str(d or "").strip().lower()
     return d[:-1] if d.endswith(".") else d
 
+
 def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
+    """Gắn danh sách tag vào event (best-effort, có retry)."""
     try:
         ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_tag")
         event_uuid = getattr(ev, "uuid", None)
@@ -206,6 +221,7 @@ def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
 
 
 def normalize_url(u: str) -> str:
+    """Chuẩn hóa URL (lower netloc, giữ nguyên scheme/path/query)."""
     u = str(u or "").strip()
     try:
         p = urlparse(u)
@@ -215,6 +231,7 @@ def normalize_url(u: str) -> str:
         return u
 
 # ===== ES fetch (ip/domain/url/hash/credential) =====
+# Xây dựng danh sách field cần lấy từ ES
 ES_SOURCE_FIELDS = [
     "@timestamp",
     "source.ip","src_ip",
@@ -228,6 +245,7 @@ ES_SOURCE_FIELDS = [
 
 
 def fetch_iocs_from_es():
+    """Truy vấn ES, trích IoC (dedupe), trả về DataFrame(các IoC)."""
     # ES client
     es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
     esq = es.options(request_timeout=60)
@@ -249,6 +267,7 @@ def fetch_iocs_from_es():
     rows = []       # list[dict]
 
     def add_row(ts, src_ip, typ, val):
+        """Thêm 1 IoC vào rows nếu chưa thấy trước đó."""
         if not typ or not val:
             return
         key = (typ, val)
@@ -382,6 +401,7 @@ def fetch_iocs_from_es():
 # ===== MISP mapping / push =====
 
 def map_row_to_misp(row):
+    """Map 1 dòng IoC → tuple attribute cho MISP (type, category, to_ids, value, comment, is_private)."""
     ioc_type = str(row.get("ioc_type", "")).strip().lower()
     value    = str(row.get("value", "")).strip()
     if not value:
@@ -439,12 +459,14 @@ def map_row_to_misp(row):
 
 
 def create_daily_event_title():
-    # Ví dụ: "T-Pot IoC Collection - 2025-08-09 14:00" nếu format có giờ
+    """Tạo tiêu đề event theo prefix + EVENT_TITLE_FORMAT (theo giờ local)."""
     ts = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
     return f"{EVENT_TITLE_PREFIX} - {ts}"
 
 
+
 def create_event(misp: PyMISP, title: str) -> str:
+    """Tạo MISP Event mới và trả về event_id."""
     ev = MISPEvent()
     ev.info            = title
     ev.distribution    = EVENT_DISTRIBUTION
@@ -468,6 +490,7 @@ def create_event(misp: PyMISP, title: str) -> str:
 
 
 def get_event_id(misp: PyMISP):
+    """Lấy event_id theo EVENT_MODE (DAILY/APPEND). DAILY: tìm theo title, không có thì tạo mới."""
     today_title = f"{EVENT_TITLE_PREFIX} - {datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)}"
 
     if EVENT_MODE == "APPEND":
@@ -512,6 +535,7 @@ def get_event_id(misp: PyMISP):
 
 
 def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
+    """Đẩy các IoC trong DataFrame vào MISP Event (check trùng, tag IP private nếu cấu hình)."""
     existing = set()
     try:
         ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_attrs")
@@ -563,7 +587,9 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
 
 
 # ===== main =====
+
 def main():
+    """Luồng chính: fetch ES → kết nối MISP → lấy/tạo Event → gắn tag → add attributes."""
     if not VERIFY_SSL:
         logger.warning("MISP SSL verification DISABLED (lab only)")
 
