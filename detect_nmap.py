@@ -26,6 +26,7 @@ ES_INDEX = os.getenv("ES_INDEX", "logstash-*")
 HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "2"))
 VERIFY_SSL = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
 EVENT_TITLE_NMAP = os.getenv("EVENT_TITLE_NMAP", "Nmap Scan Detected")
+SAFE_IPS = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 
 missing = []
 for k,v in {"ES_URL":ES_URL,"MISP_URL":MISP_URL,"MISP_KEY":MISP_KEY}.items():
@@ -87,6 +88,7 @@ def create_event(misp: PyMISP, title: str):
 def main():
     conns = fetch_connections_from_es()
     suspects = detect_scanners(conns, threshold=10)  # ngưỡng tuỳ chỉnh
+    suspects = [ip for ip in suspects if ip not in SAFE_IPS]
     if not suspects:
         print("[!] Không phát hiện Nmap scan trong log.")
         return
