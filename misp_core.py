@@ -12,7 +12,7 @@ from config import (
     DISABLE_IDS_FOR_PRIVATE, TAG_PRIVATE_IP_ATTR, PRIVATE_IP_TAG,
     EVENT_TITLE_NMAP, EVENT_TITLE_DDOS, logger
 )
-from utils import with_retry, classify_hash, is_non_routable_ip, fmt_local_ts_for_comment
+from utils import with_retry, classify_hash, is_non_routable_ip, _fmt_local_ts_for_comment
 
 # Map base (non-hash)
 MAPPING_BASE = {
@@ -211,7 +211,7 @@ def create_nmap_event_and_push(misp: PyMISP, ip_list: List[str], ts_suffix: Opti
         return ""
     title = f"{EVENT_TITLE_NMAP} - {(ts_suffix or _today_suffix())}"
     ev_id = _create_event_with_title(misp, title)
-    ts_local = fmt_local_ts_for_comment()
+    ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
         comment = f"src_ip={ip}; ts={ts_local}; detection=NmapScan"
         attr = {"type": "ip-src", "category": "Network activity", "value": ip, "to_ids": True, "comment": comment}
@@ -225,7 +225,7 @@ def create_ddos_event_and_push(misp: PyMISP, ip_list: List[str], ts_suffix: Opti
         return ""
     title = f"{EVENT_TITLE_DDOS} - {(ts_suffix or _today_suffix())}"
     ev_id = _create_event_with_title(misp, title)
-    ts_local = fmt_local_ts_for_comment()
+    ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
         comment = f"src_ip={ip}; ts={ts_local}; detection=DDOSFlood"
         attr = {"type": "ip-src", "category": "Network activity", "value": ip, "to_ids": True, "comment": comment}
