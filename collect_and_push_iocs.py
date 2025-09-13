@@ -711,7 +711,6 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
 # ===== main =====
 
 def main():
-    """Luồng chính: fetch ES → kết nối MISP → lấy/tạo Event → gắn tag → add attributes."""
     if not VERIFY_SSL:
         logger.warning("MISP SSL verification DISABLED (lab only)")
 
@@ -721,10 +720,12 @@ def main():
     logger.info(f"IoC fetched: {total}")
     if df is None or df.empty:
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
-        # KHÔNG return ở đây; vẫn chạy detection chuyên biệt bên dưới
-    else:
-        # 2) Kết nối MISP + 3) get/create event + push IoC
-        misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
+
+    # 2) Kết nối MISP (dùng chung cho push IoC và detection)
+    misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
+
+    # 3) Nếu có IoC thì lấy/tạo event chính + gắn tag + push attribute
+    if df is not None and not df.empty:
         event_id = get_event_id(misp)
         logger.info(f"Using Event ID: {event_id}")
         print(f"[+] Using Event ID: {event_id}")
@@ -734,45 +735,24 @@ def main():
         logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={len(df)}")
         print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {len(df)}")
 
-    # 2) Kết nối MISP
-    misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
-
-    # 3) Lấy hoặc tạo Event
-    event_id = get_event_id(misp)
-    logger.info(f"Using Event ID: {event_id}")
-    print(f"[+] Using Event ID: {event_id}")
-
-    # 3.1) Luôn gắn tag cho event (kể cả event đã tồn tại)
-    if MISP_TAGS:
-        tag_event(misp, event_id, MISP_TAGS)
-        
-    # 4) Đẩy attribute
-    added, skipped = push_iocs_to_misp(misp, event_id, df)
-    logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={total}")
-    print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {total}")
-
-
-        # 5) Phát hiện Nmap/DDoS → tạo event RIÊNG, dùng đuôi thời gian giống event chính
+    # 4) Phát hiện Nmap/DDoS → tạo event RIÊNG (đuôi thời gian giống event chính)
     try:
-        if DETECT_NMAP or DETECT_DDOS:
-            conns = fetch_conn_tuples_from_es()
-        else:
-            conns = None
+        conns = fetch_conn_tuples_from_es() if (DETECT_NMAP or DETECT_DDOS) else None
 
         if DETECT_NMAP and conns:
             suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
             if suspects_nmap:
-                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)  # tự nối " - <ts>" + gắn tag
+                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)
                 print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
 
         if DETECT_DDOS and conns:
             suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
             if suspects_ddos:
-                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)  # tự nối " - <ts>" + gắn tag
+                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)
                 print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
-
     except Exception as e:
         logger.error(f"Specialized detections failed: {e}")
+
 
 
 
