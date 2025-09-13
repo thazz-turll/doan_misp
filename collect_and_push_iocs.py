@@ -21,6 +21,12 @@ from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+from utils import (
+    with_retry, first, many, classify_hash, is_non_routable_ip,
+    normalize_domain, normalize_url, fmt_local_ts_for_comment
+)
+
+
 from config import (
     # Kết nối
     ES_URL, ES_INDEX, HOURS_LOOKBACK,
@@ -45,8 +51,6 @@ from config import (
     # Logger dùng chung
     logger
 )
-
-
 # ===== Regex/hash/url =====
 # Regex nhận diện hash/URL/domain trong log
 MD5_RE    = re.compile(r"^[a-fA-F0-9]{32}$")
@@ -81,103 +85,6 @@ MAPPING_BASE = {
 
 
 # ===== Helpers =====
-def _fmt_local_ts_for_comment() -> str:
-    """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
-    d = datetime.now().astimezone()
-    tz_raw = d.strftime("%z")  # ví dụ +0700
-    tz_short = tz_raw[:3] if tz_raw else ""
-    return d.strftime("%Y-%m-%d %H:%M:%S") + (f" {tz_short}" if tz_short else "")
-
-
-
-def _is_retryable_exc(e):
-    """Xác định lỗi tạm thời (nên retry)."""
-    # ES errors
-    if isinstance(e, (ESConnectionError, TransportError)):
-        try:
-            status = getattr(e, "status_code", None) or getattr(e, "status", None)
-        except Exception:
-            status = None
-        # retry cho lỗi mạng, 5xx, 429
-        if status in (429, 500, 502, 503, 504) or status is None:
-            return True
-        return False
-
-    # Requests / PyMISP
-    if isinstance(e, RequestException):
-        # đa phần lỗi mạng tạm thời trong nhóm này → retry
-        return True
-
-    # Các Exception khác: cho retry một cách thận trọng
-    return False
-
-
-def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, who="op"):
-    """Chạy func() với exponential backoff/retry cho lỗi tạm thời."""
-    attempt = 0
-    while True:
-        try:
-            return func()
-        except Exception as e:
-            attempt += 1
-            if not _is_retryable_exc(e) or attempt >= max_attempts:
-                logger.error(f"[{who}] FAILED after {attempt} attempts: {e}")
-                raise
-            delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, base)
-            logger.warning(f"[{who}] attempt {attempt} failed: {e} → retry in {delay:.2f}s")
-            time.sleep(delay)
-
-
-def first(v):
-    """Lấy phần tử đầu nếu v là list, ngược lại trả về v."""
-    if isinstance(v, list) and v:
-        return v[0]
-    return v
-
-
-def many(v):
-    """Đảm bảo giá trị là list (bọc đơn thành list)."""
-    if isinstance(v, list):
-        return v
-    return [v] if v is not None else []
-
-
-def classify_hash(h: str):
-    """Phân loại hash theo độ dài: md5/sha1/sha256/sha512, không khớp → None."""
-    if not isinstance(h, str):
-        return None
-    v = h.strip()
-    if MD5_RE.fullmatch(v): return "md5"
-    if SHA1_RE.fullmatch(v): return "sha1"
-    if SHA256_RE.fullmatch(v): return "sha256"
-    if SHA512_RE.fullmatch(v): return "sha512"
-    return None
-
-
-def is_non_routable_ip(ip_str: str) -> bool:
-    """Kiểm tra IP có phải non-routable/private/loopback..."""
-    try:
-        ip_obj = ipaddress.ip_address(ip_str)
-    except Exception:
-        return False
-    return (
-        ip_obj.is_private
-        or ip_obj.is_loopback
-        or ip_obj.is_link_local
-        or ip_obj.is_multicast
-        or ip_obj.is_reserved
-        or ip_obj.is_unspecified
-        or getattr(ip_obj, "is_site_local", False)
-        or getattr(ip_obj, "is_global", None) is False
-    )
-
-
-def normalize_domain(d: str) -> str:
-    """Chuẩn hóa domain/hostname (lower, bỏ dấu chấm cuối)."""
-    d = str(d or "").strip().lower()
-    return d[:-1] if d.endswith(".") else d
-
-
 def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
     """Gắn danh sách tag vào event (best-effort, có retry)."""
     try:
@@ -197,15 +104,6 @@ def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
 
 
 
-def normalize_url(u: str) -> str:
-    """Chuẩn hóa URL (lower netloc, giữ nguyên scheme/path/query)."""
-    u = str(u or "").strip()
-    try:
-        p = urlparse(u)
-        netloc = p.netloc.lower()
-        return f"{p.scheme}://{netloc}{p.path or ''}{('?' + p.query) if p.query else ''}"
-    except Exception:
-        return u
 
 # ===== ES fetch (ip/domain/url/hash/credential) =====
 # Xây dựng danh sách field cần lấy từ ES
