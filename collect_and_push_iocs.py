@@ -741,7 +741,7 @@ def main():
     print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {total}")
 
 
-        # 5) (TÙY CHỌN) Phát hiện Nmap/DDoS và tạo event riêng
+        # 5) Phát hiện Nmap/DDoS → tạo event RIÊNG, dùng đuôi thời gian giống event chính
     try:
         if DETECT_NMAP or DETECT_DDOS:
             conns = fetch_conn_tuples_from_es()
@@ -751,17 +751,13 @@ def main():
         if DETECT_NMAP and conns:
             suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
             if suspects_nmap:
-                ev_nmap = create_single_event_and_push_ips(
-                    misp, EVENT_TITLE_NMAP, suspects_nmap, comment="Nmap-like port scan"
-                )
+                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)  # tự nối " - <ts>" + gắn tag
                 print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
 
         if DETECT_DDOS and conns:
             suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
             if suspects_ddos:
-                ev_ddos = create_single_event_and_push_ips(
-                    misp, EVENT_TITLE_DDOS, suspects_ddos, comment="SYN-flood-like burst"
-                )
+                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)  # tự nối " - <ts>" + gắn tag
                 print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
 
     except Exception as e:
