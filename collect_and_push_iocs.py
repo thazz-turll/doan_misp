@@ -721,7 +721,18 @@ def main():
     logger.info(f"IoC fetched: {total}")
     if df is None or df.empty:
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
-        return
+        # KHÔNG return ở đây; vẫn chạy detection chuyên biệt bên dưới
+    else:
+        # 2) Kết nối MISP + 3) get/create event + push IoC
+        misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
+        event_id = get_event_id(misp)
+        logger.info(f"Using Event ID: {event_id}")
+        print(f"[+] Using Event ID: {event_id}")
+        if MISP_TAGS:
+            tag_event(misp, event_id, MISP_TAGS)
+        added, skipped = push_iocs_to_misp(misp, event_id, df)
+        logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={len(df)}")
+        print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {len(df)}")
 
     # 2) Kết nối MISP
     misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
