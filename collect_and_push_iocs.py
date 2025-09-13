@@ -549,6 +549,42 @@ def create_daily_event_title():
     ts = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
     return f"{EVENT_TITLE_PREFIX} - {ts}"
 
+def _get_ts_suffix_from_daily() -> str:
+    return create_daily_event_title().split(" - ", 1)[-1]
+
+def _create_event_with_title(misp: PyMISP, title: str) -> str:
+    ev = MISPEvent()
+    ev.info = title
+    ev.distribution = EVENT_DISTRIBUTION
+    ev.analysis = EVENT_ANALYSIS
+    ev.threat_level_id = THREAT_LEVEL_ID
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
+    try:
+        ev_id = res["Event"]["id"]
+    except Exception:
+        ev_id = getattr(res, "id", None)
+    ev_id = str(ev_id)
+    if MISP_TAGS:
+        tag_event(misp, ev_id, MISP_TAGS)
+    return ev_id
+
+def create_nmap_event_and_push(misp: PyMISP, ip_list: list[str], comment: str = "Nmap-like port scan") -> str:
+    title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
+    ev_id = _create_event_with_title(misp, title)
+    for ip in ip_list:
+        attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
+        with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id}")
+    return ev_id
+
+def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str], comment: str = "SYN-flood-like burst") -> str:
+    title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
+    ev_id = _create_event_with_title(misp, title)
+    for ip in ip_list:
+        attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
+        with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id}")
+    return ev_id
 
 
 def create_event(misp: PyMISP, title: str) -> str:
