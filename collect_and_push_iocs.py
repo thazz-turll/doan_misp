@@ -166,15 +166,15 @@ def main():
         conns = fetch_conn_tuples_from_es() if (DETECT_NMAP or DETECT_DDOS) else None
 
         if DETECT_NMAP and conns:
-            suspects_nmap = detect_nmap_scanners(misp, suspects_nmap, ts_suffix)
+            suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
             if suspects_nmap:
-                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)
+                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap, ts_suffix)
                 print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
 
         if DETECT_DDOS and conns:
             suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
             if suspects_ddos:
-                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos, ts_suffix)
+                ev_ddos = create_ddos_event_and_push(ddos, suspects_ddos, ts_suffix)
                 print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
     except Exception as e:
         logger.error(f"Specialized detections failed: {e}")
