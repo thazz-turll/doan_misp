@@ -124,6 +124,15 @@ SAFE_IPS         = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if
 
 
 
+def _fmt_local_ts_for_comment() -> str:
+    """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
+    d = datetime.now().astimezone()
+    tz_raw = d.strftime("%z")  # ví dụ +0700
+    tz_short = tz_raw[:3] if tz_raw else ""
+    return d.strftime("%Y-%m-%d %H:%M:%S") + (f" {tz_short}" if tz_short else "")
+
+
+
 def _is_retryable_exc(e):
     """Xác định lỗi tạm thời (nên retry)."""
     # ES errors
@@ -568,23 +577,29 @@ def _create_event_with_title(misp: PyMISP, title: str) -> str:
         tag_event(misp, ev_id, MISP_TAGS)
     return ev_id
 
-def create_nmap_event_and_push(misp: PyMISP, ip_list: list[str], comment: str = "Nmap-like port scan") -> str:
+def create_nmap_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
     title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
+    ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
+        comment = f"src_ip={ip}; ts={ts_local}; detection=NmapScan"
         attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
         with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id}")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
 
-def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str], comment: str = "SYN-flood-like burst") -> str:
+
+def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
     title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
+    ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
+        comment = f"src_ip={ip}; ts={ts_local}; detection=DDOSFlood"
         attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
         with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id}")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
+
 
 
 def create_event(misp: PyMISP, title: str) -> str:
