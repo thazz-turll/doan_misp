@@ -75,7 +75,7 @@ def normalize_url(u: str) -> str:
     except Exception:
         return u
 
-def fmt_local_ts_for_comment() -> str:
+def _fmt_local_ts_for_comment() -> str:
     d = datetime.now().astimezone()
     tz_raw = d.strftime("%z")  # ví dụ +0700
     tz_short = tz_raw[:3] if tz_raw else ""
