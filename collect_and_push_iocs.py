@@ -174,7 +174,7 @@ def main():
         if DETECT_DDOS and conns:
             suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
             if suspects_ddos:
-                ev_ddos = create_ddos_event_and_push(ddos, suspects_ddos, ts_suffix)
+                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos, ts_suffix)
                 print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
     except Exception as e:
         logger.error(f"Specialized detections failed: {e}")
