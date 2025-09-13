@@ -23,7 +23,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from utils import (
     with_retry, first, many, classify_hash, is_non_routable_ip,
-    normalize_domain, normalize_url, fmt_local_ts_for_comment
+    normalize_domain, normalize_url, _fmt_local_ts_for_comment
 )
 
 
