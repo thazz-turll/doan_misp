@@ -611,9 +611,9 @@ def create_event(misp: PyMISP, title: str) -> str:
 
 
 
-def get_event_id(misp: PyMISP):
-    """Lấy event_id theo EVENT_MODE (DAILY/APPEND). DAILY: tìm theo title, không có thì tạo mới."""
-    today_title = f"{EVENT_TITLE_PREFIX} - {datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)}"
+def get_event_id(misp: PyMISP, ts_suffix: str | None = None):
+    suffix = ts_suffix or datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
+    today_title = f"{EVENT_TITLE_PREFIX} - {suffix}"
 
     if EVENT_MODE == "APPEND":
         if not MISP_EVENT_ID:
@@ -714,6 +714,17 @@ def main():
     if not VERIFY_SSL:
         logger.warning("MISP SSL verification DISABLED (lab only)")
 
+    # Freeze suffix ngày cho toàn bộ run (đảm bảo Nmap/DDOS trùng ngày với event chính)
+    ts_suffix = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
+
+    # Override helper để mọi nơi dùng cùng 1 suffix
+    def _fixed_suffix() -> str:
+        return ts_suffix
+    global _get_ts_suffix_from_daily
+    _get_ts_suffix_from_daily = _fixed_suffix
+
+    
+
     # 1) Lấy IoC từ ES
     df = fetch_iocs_from_es()
     total = 0 if df is None or df.empty else len(df)
@@ -726,7 +737,7 @@ def main():
 
     # 3) Nếu có IoC thì lấy/tạo event chính + gắn tag + push attribute
     if df is not None and not df.empty:
-        event_id = get_event_id(misp)
+        event_id = get_event_id(misp, ts_suffix=ts_suffix)
         logger.info(f"Using Event ID: {event_id}")
         print(f"[+] Using Event ID: {event_id}")
         if MISP_TAGS:
