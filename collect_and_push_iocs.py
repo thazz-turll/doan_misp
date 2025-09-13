@@ -113,6 +113,17 @@ RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
 # ===== Helpers =====
 
 
+
+DETECT_NMAP      = os.getenv("DETECT_NMAP", "false").lower() == "true"
+DETECT_DDOS      = os.getenv("DETECT_DDOS", "false").lower() == "true"
+NMAP_THRESHOLD   = int(os.getenv("NMAP_THRESHOLD", "10"))
+DDOS_THRESHOLD   = int(os.getenv("DDOS_THRESHOLD", "100"))
+EVENT_TITLE_NMAP = os.getenv("EVENT_TITLE_NMAP", "Nmap Scan Detected")
+EVENT_TITLE_DDOS = os.getenv("EVENT_TITLE_DDOS", "Potential DDoS Activity (SYN Flood)")
+SAFE_IPS         = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
+
+
+
 def _is_retryable_exc(e):
     """Xác định lỗi tạm thời (nên retry)."""
     # ES errors
@@ -398,6 +409,54 @@ def fetch_iocs_from_es():
     return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
 
 
+
+def fetch_conn_tuples_from_es():
+    """
+    Lấy (src_ip, dst_port) trong khoảng HOURS_LOOKBACK để phục vụ heuristics Nmap/DDoS.
+    """
+    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
+    esq = es.options(request_timeout=60)
+
+    now = datetime.now(timezone.utc)
+    start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
+
+    body = {
+        "_source": ["@timestamp", "source.ip", "src_ip", "destination.port", "dest_port"],
+        "query": {"range": {"@timestamp": {"gte": start}}},
+        "size": 5000,
+        "sort": [{"@timestamp": {"order": "desc"}}],
+        "track_total_hits": False
+    }
+    resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search_conn")
+
+    rows = []
+    for h in resp.get("hits", {}).get("hits", []):
+        s = h.get("_source", {}) or {}
+        ip = first(s.get("source.ip")) or first(s.get("src_ip"))
+        dp = first(s.get("destination.port")) or first(s.get("dest_port"))
+        if ip and dp:
+            rows.append((str(ip), str(dp)))
+    return rows
+
+def detect_nmap_scanners(conns, threshold: int):
+    """Trả về list IP có số cổng duy nhất >= threshold."""
+    if not conns:
+        return []
+    df = pd.DataFrame(conns, columns=["ip", "port"])
+    grouped = df.groupby("ip")["port"].nunique()
+    suspects = [ip for ip, cnt in grouped.items() if cnt >= threshold]
+    return [ip for ip in suspects if ip not in SAFE_IPS]
+
+def detect_ddos_sources(conns, threshold: int):
+    """Trả về list IP có tổng số record >= threshold (dấu hiệu flood)."""
+    if not conns:
+        return []
+    df = pd.DataFrame([c[0] for c in conns], columns=["ip"])
+    grouped = df.groupby("ip").size()
+    suspects = [ip for ip, cnt in grouped.items() if cnt >= threshold]
+    return [ip for ip in suspects if ip not in SAFE_IPS]
+
+
 # ===== MISP mapping / push =====
 
 def map_row_to_misp(row):
@@ -456,6 +515,33 @@ def map_row_to_misp(row):
     else:
         return None
 
+def create_single_event_and_push_ips(misp: PyMISP, title: str, ip_list: list[str], comment: str = "") -> str:
+    """Tạo event mới với 'title' và add các ip-src; trả về event_id."""
+    ev = MISPEvent()
+    ev.info            = title
+    ev.distribution    = EVENT_DISTRIBUTION
+    ev.analysis        = EVENT_ANALYSIS
+    ev.threat_level_id = THREAT_LEVEL_ID
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
+
+    event_id = None
+    try:
+        event_id = res["Event"]["id"]
+    except Exception:
+        event_id = getattr(res, "id", None)
+
+    event_id = str(event_id)
+    for ip in ip_list:
+        attr = {
+            "type": "ip-src",
+            "category": "Network activity",
+            "value": ip,
+            "to_ids": True,
+            "comment": comment or "Detected by heuristic",
+        }
+        with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True), who="misp.add_attr_detection")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {event_id}")
+    return event_id
 
 
 def create_daily_event_title():
@@ -617,6 +703,34 @@ def main():
     added, skipped = push_iocs_to_misp(misp, event_id, df)
     logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={total}")
     print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {total}")
+
+
+        # 5) (TÙY CHỌN) Phát hiện Nmap/DDoS và tạo event riêng
+    try:
+        if DETECT_NMAP or DETECT_DDOS:
+            conns = fetch_conn_tuples_from_es()
+        else:
+            conns = None
+
+        if DETECT_NMAP and conns:
+            suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
+            if suspects_nmap:
+                ev_nmap = create_single_event_and_push_ips(
+                    misp, EVENT_TITLE_NMAP, suspects_nmap, comment="Nmap-like port scan"
+                )
+                print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
+
+        if DETECT_DDOS and conns:
+            suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
+            if suspects_ddos:
+                ev_ddos = create_single_event_and_push_ips(
+                    misp, EVENT_TITLE_DDOS, suspects_ddos, comment="SYN-flood-like burst"
+                )
+                print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
+
+    except Exception as e:
+        logger.error(f"Specialized detections failed: {e}")
+
 
 
 if __name__ == "__main__":
