@@ -21,58 +21,31 @@ from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ===== .env =====
-# Load biến môi trường (nếu có .env)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+from config import (
+    # Kết nối
+    ES_URL, ES_INDEX, HOURS_LOOKBACK,
+    MISP_URL, MISP_KEY, VERIFY_SSL,
 
-# ===== CONFIG (bắt buộc từ ENV, không hardcode URL) =====
-# Đọc cấu hình chính từ ENV
-ES_URL = os.getenv("ES_URL")                # bắt buộc
-MISP_URL = os.getenv("MISP_URL")            # bắt buộc
-MISP_KEY = os.getenv("MISP_KEY")            # bắt buộc
-EVENT_TITLE_PREFIX = os.getenv("EVENT_TITLE_PREFIX", "T-Pot IoC Collection")
-EVENT_TITLE_FORMAT = os.getenv("EVENT_TITLE_FORMAT", "%Y-%m-%d")
-missing = []
-if not ES_URL:   missing.append("ES_URL")
-if not MISP_URL: missing.append("MISP_URL")
-if not MISP_KEY: missing.append("MISP_KEY")
-if missing:
-    sys.stderr.write(f"[CONFIG ERROR] Missing required env: {', '.join(missing)}\n")
-    sys.exit(1)
+    # Thông số event
+    EVENT_TITLE_PREFIX, EVENT_TITLE_FORMAT,
+    EVENT_DISTRIBUTION, EVENT_ANALYSIS, THREAT_LEVEL_ID, MISP_TAGS,
+    EVENT_MODE, MISP_EVENT_ID,                    # ✅ thêm
 
-# Các tham số không nhạy cảm
-ES_INDEX       = os.getenv("ES_INDEX", "logstash-*")
-HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "2"))
+    # Xử lý IP private
+    DISABLE_IDS_FOR_PRIVATE, TAG_PRIVATE_IP_ATTR, PRIVATE_IP_TAG,
 
-VERIFY_SSL     = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
-EVENT_MODE     = os.getenv("EVENT_MODE", "DAILY").upper()          # DAILY | APPEND
-MISP_EVENT_ID  = os.getenv("MISP_EVENT_ID")                        # cần khi APPEND
+    # Detection
+    DETECT_NMAP, DETECT_DDOS, NMAP_THRESHOLD, DDOS_THRESHOLD,
+    EVENT_TITLE_NMAP, EVENT_TITLE_DDOS,          # ✅ thêm
+    SAFE_IPS,
 
-EVENT_DISTRIBUTION = int(os.getenv("MISP_DISTRIBUTION", "0"))
-EVENT_ANALYSIS     = int(os.getenv("MISP_ANALYSIS", "0"))
-THREAT_LEVEL_ID    = int(os.getenv("MISP_THREAT_LEVEL_ID", "2"))
-MISP_TAGS          = [t.strip() for t in os.getenv("MISP_TAGS", "source:t-pot,tlp:amber").split(",") if t.strip()]
+    # Retry cho with_retry
+    RETRY_BASE, RETRY_CAP, RETRY_MAX,            # ✅ thêm
 
-DISABLE_IDS_FOR_PRIVATE = os.getenv("DISABLE_IDS_FOR_PRIVATE_IP", "true").lower() == "true"
-TAG_PRIVATE_IP_ATTR     = os.getenv("TAG_PRIVATE_IP_ATTR", "false").lower() == "true"
-PRIVATE_IP_TAG          = os.getenv("PRIVATE_IP_TAG", "scope:internal")
+    # Logger dùng chung
+    logger
+)
 
-# Logging
-LOG_FILE       = os.getenv("LOG_FILE", "ioc_es_to_misp.log")
-LOG_MAX_BYTES  = int(os.getenv("LOG_MAX_BYTES", "1048576"))  # 1MB
-LOG_BACKUPS    = int(os.getenv("LOG_BACKUPS", "3"))
-
-# ===== Logger =====
-# Khởi tạo logger xoay vòng file
-logger = logging.getLogger("ioc-es-misp-v3")
-logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-logger.addHandler(handler)
 
 # ===== Regex/hash/url =====
 # Regex nhận diện hash/URL/domain trong log
@@ -106,24 +79,8 @@ MAPPING_BASE = {
     "credential":("text",   "Other",            False),  # không đẩy sang IDS
 }
 
-RETRY_BASE = float(os.getenv("RETRY_BASE", "0.5"))   # giây
-RETRY_CAP  = float(os.getenv("RETRY_CAP", "8"))      # giây
-RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
 
 # ===== Helpers =====
-
-
-
-DETECT_NMAP      = os.getenv("DETECT_NMAP", "false").lower() == "true"
-DETECT_DDOS      = os.getenv("DETECT_DDOS", "false").lower() == "true"
-NMAP_THRESHOLD   = int(os.getenv("NMAP_THRESHOLD", "10"))
-DDOS_THRESHOLD   = int(os.getenv("DDOS_THRESHOLD", "100"))
-EVENT_TITLE_NMAP = os.getenv("EVENT_TITLE_NMAP", "Nmap Scan Detected")
-EVENT_TITLE_DDOS = os.getenv("EVENT_TITLE_DDOS", "Potential DDoS Activity (SYN Flood)")
-SAFE_IPS         = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
-
-
-
 def _fmt_local_ts_for_comment() -> str:
     """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
     d = datetime.now().astimezone()
