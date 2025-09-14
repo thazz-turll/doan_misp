@@ -4,8 +4,8 @@
 """
 Scenario 3 - Botnet infection attempt detector for T-Pot/Cowrie → push IoCs to MISP
 - 1 EVENT DUY NHẤT: gom mọi phiên có login thành công (weak creds).
-- Phiên có payload/C2 sẽ có thêm URL/domain/ip-dst/sha256.
-- Bản này bổ sung LOG để kiểm thử và fallback type cho MISP.
+- Phiên có payload/C2 sẽ có thêm URL/ip-dst/sha256.
+- Bản này: credential xuất value dạng "user:pass" (text, Other, to_ids=False) giống code chính.
 """
 
 import os, sys, re, logging, hashlib, socket, json
@@ -35,7 +35,7 @@ ES_INDEX = os.getenv("ES_INDEX", "logstash-*")
 
 HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "12"))
 VERIFY_SSL     = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
-EVENT_TITLE    = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Scenario 3)")
+EVENT_TITLE    = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
 
 SAFE_IPS = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
@@ -86,7 +86,7 @@ def fetch_cowrie_events():
         "_source": [
             "@timestamp", "eventid", "session",
             "src_ip", "source.ip",
-            "username", "password",
+            "username", "user.name", "password",
             "message", "args",
             "url", "shasum",
             "path", "type"
@@ -113,7 +113,6 @@ def fetch_cowrie_events():
     hits = resp.get("hits", {}).get("hits", [])
     events = [h.get("_source", {}) for h in hits]
     logger.info(f"Fetched {len(events)} Cowrie events from ES")
-    # Log vài mẫu để kiểm tra format
     for i, e in enumerate(events[:5]):
         logger.debug(f"[ES SAMPLE {i}] {json.dumps(e, ensure_ascii=False)}")
     return events
@@ -121,6 +120,7 @@ def fetch_cowrie_events():
 # ================== Parse Helpers ==================
 URL_RGX = re.compile(r"""(?P<url>(?:https?|ftp)://[^\s'"]+)""", re.IGNORECASE)
 LOGIN_SUCC_RGX = re.compile(r'login attempt \[([^/\]]+)/([^\]]+)\]\s+succeeded', re.IGNORECASE)
+IP_HOST_RGX = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 
 def extract_urls_from_command(msg, args):
     texts = []
@@ -188,15 +188,15 @@ def correlate_sessions(events):
 
         ev = (s.get("eventid") or "").lower()
 
-        # Lấy trực tiếp trường có cấu trúc
         if ev.endswith("login.success"):
-            u_direct = s.get("username")
+            # Lấy trực tiếp field có cấu trúc
+            u_direct = s.get("username") or s.get("user.name")
             p_direct = s.get("password")
             if u_direct: o["username"] = str(u_direct)
             if p_direct: o["password"] = str(p_direct)
             logger.info(f"[DEBUG] login.success session={sess} user={o['username']} pass={o['password']} (direct fields)")
 
-            # Fallback từ message nếu thiếu
+            # Fallback regex từ message nếu thiếu
             if not o["username"] or not o["password"]:
                 m = LOGIN_SUCC_RGX.search(str(s.get("message","")))
                 if m:
@@ -263,7 +263,6 @@ def add_attr_safe(misp, event_id, pref_type, value, category, comment, to_ids=Tr
     except Exception as e:
         msg = str(e)
         logger.warning(f"[WARN] add_attr type={pref_type} failed: {msg}")
-        # Fallback khi gặp Invalid type
         if "Invalid type" in msg or "403" in msg:
             try:
                 _misp_add_attr_raw(misp, event_id, "text", value, category, f"{comment} [fallback text]", to_ids=False)
@@ -328,16 +327,15 @@ def main():
                       category="Network activity",
                       comment=f"Attacker IP (Cowrie session {sess_id})", to_ids=True)
 
-        # Credentials:
-        # Thử type 'username'/'password', nếu fail → fallback text
-        add_attr_safe(misp, event_id, "username", user,
-                      category="Payload delivery",
-                      comment=f"Credential used (session {sess_id})", to_ids=False)
-        add_attr_safe(misp, event_id, "password", passwd,
-                      category="Payload delivery",
-                      comment=f"Credential used (session {sess_id})", to_ids=False)
+        # ===== Credential: user:pass (giống code chính) =====
+        if user or passwd:
+            cred_val = f"{user or ''}:{passwd or ''}"
+            # type text, category Other, to_ids=False
+            add_attr_safe(misp, event_id, "text", cred_val,
+                          category="Other",
+                          comment=f"credential used (session {sess_id})", to_ids=False)
 
-        # Nếu có dấu hiệu payload/C2 thì thêm URL/domain/ip-dst/sha256
+        # Nếu có dấu hiệu payload/C2 thì thêm URL/ip-dst/sha256
         if has_url:
             for u in urls:
                 add_attr_safe(misp, event_id, "url", u,
@@ -345,16 +343,20 @@ def main():
                               comment=f"Payload URL observed in commands (session {sess_id})", to_ids=True)
                 try:
                     p = urlparse(u)
-                    if p.hostname:
-                        add_attr_safe(misp, event_id, "domain", p.hostname,
-                                      category="Network activity",
-                                      comment=f"C2 host from URL (session {sess_id})", to_ids=True)
-                        dst_ip = resolve_ip(p.hostname)
-                        add_attr_safe(misp, event_id, "ip-dst", dst_ip,
-                                      category="Network activity",
-                                      comment=f"Resolved C2 IP (session {sess_id})", to_ids=True)
+                    host = p.hostname
+                    if host:
+                        # KHÔNG add domain nếu host là IP
+                        if not IP_HOST_RGX.match(host):
+                            add_attr_safe(misp, event_id, "domain", host,
+                                          category="Network activity",
+                                          comment=f"C2 host from URL (session {sess_id})", to_ids=True)
+                        dst_ip = resolve_ip(host)
+                        if dst_ip:
+                            add_attr_safe(misp, event_id, "ip-dst", dst_ip,
+                                          category="Network activity",
+                                          comment=f" Resolved C2 IP (session {sess_id})", to_ids=True)
                 except Exception as e:
-                    logger.warning(f"[WARN] parse URL failed: {u} | {e}")
+                    logger.warning(f"[WARN] parse/resolve URL failed: {u} | {e}")
 
             for d in dloads:
                 u = d.get("url")
@@ -365,9 +367,10 @@ def main():
                                   comment=f"File hash reported by Cowrie (session {sess_id})", to_ids=True)
                 elif ALLOW_SAMPLE_FETCH and u:
                     h = safe_fetch_sha256(u)
-                    add_attr_safe(misp, event_id, "sha256", h,
-                                  category="Artifacts dropped",
-                                  comment=f"SHA256 computed in LAB (session {sess_id})", to_ids=True)
+                    if h:
+                        add_attr_safe(misp, event_id, "sha256", h,
+                                      category="Artifacts dropped",
+                                      comment=f"SHA256 computed in LAB (session {sess_id})", to_ids=True)
 
     print(f"[+] Done. Pushed {len(suspects)} session(s) worth of IoCs to MISP into ONE event.")
     logger.info(f"Done. Suspect sessions pushed: {len(suspects)}")
