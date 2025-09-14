@@ -30,7 +30,7 @@ ES_URL   = os.getenv("ES_URL")
 MISP_URL = os.getenv("MISP_URL")
 MISP_KEY = os.getenv("MISP_KEY")
 ES_INDEX = os.getenv("ES_INDEX", "logstash-*")
-HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "2"))
+HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "12"))
 
 VERIFY_SSL = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
 EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
