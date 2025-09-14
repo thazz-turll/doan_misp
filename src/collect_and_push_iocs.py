@@ -135,7 +135,13 @@ EVENT_TITLE_NMAP = os.getenv("EVENT_TITLE_NMAP", "Nmap Scan Detected")
 EVENT_TITLE_DDOS = os.getenv("EVENT_TITLE_DDOS", "Potential DDoS Activity (SYN Flood)")
 SAFE_IPS         = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 
+def es_client():
+    return Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
 
+def time_range_clause(hours: int):
+    now = datetime.now(timezone.utc)
+    start = (now - relativedelta(hours=hours)).isoformat()
+    return {"range": {"@timestamp": {"gte": start}}}
 
 def _fmt_local_ts_for_comment() -> str:
     """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
@@ -730,29 +736,50 @@ def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
         logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
 
-def create_botnet_event_and_push(misp, sessions, ts_suffix):
-    """
-    Tạo event Botnet theo tiêu đề: EVENT_TITLE_BOTNET + ' - ' + ts_suffix
-    và đẩy các thuộc tính (ip-src, domain/url/ip-dst, sha256, creds).
-    """
-    title = f"{EVENT_TITLE_BOTNET} - {ts_suffix}"
+
+
+def fmt_comment(src_ip: str, session_id: str | None, ts_first: str | None) -> str:
+    parts = []
+    if src_ip: parts.append(f"src_ip={src_ip}")
+    if session_id: parts.append(f"session={session_id}")
+    if ts_first:
+        try:
+            dt = parser.isoparse(ts_first)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parts.append("ts=" + dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"))
+        except Exception:
+            parts.append(f"ts={ts_first}")
+    return "; ".join(parts)
+
+def add_attr_safe(misp: PyMISP, event_id: str, a_type: str, value: str,
+                  category: str = "Other", comment: str = "", to_ids: bool = False):
+    attr = {"type": a_type, "category": category, "value": value,
+            "to_ids": to_ids, "comment": comment}
+    return with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True),
+                      who="misp.add_attribute_botnet")
+
+
+def create_botnet_event_and_push(misp, sessions):
+    title = f"{EVENT_TITLE_BOTNET} - {_get_ts_suffix_from_daily()}"
     ev = MISPEvent()
     ev.info = title
-    ev.distribution = 0
-    ev.analysis = 0
-    ev.threat_level_id = 2
+    ev.distribution = EVENT_DISTRIBUTION
+    ev.analysis = EVENT_ANALYSIS
+    ev.threat_level_id = THREAT_LEVEL_ID
 
-    res = misp.add_event(ev)
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_botnet")
     event_id = str(res["Event"]["id"])
 
     logger = logging.getLogger("botnet-detect")
     logger.info(f"[Botnet] Created MISP event id={event_id} title='{title}'")
 
-    # Nếu code chính của bạn có hàm add_tags_to_event(...), gọi ở đây để gắn cùng bộ tags:
-    try:
-        add_tags_to_event(misp, event_id)  # <-- tái dùng nếu đã có
-    except NameError:
-        pass  # bỏ qua nếu code chính chưa có
+    # Gắn tag như event chính (nếu có)
+    if MISP_TAGS:
+        try:
+            tag_event(misp, event_id, MISP_TAGS)
+        except Exception as e:
+            logger.warning(f"Tag event failed: {e}")
 
     for sid, info in sessions.items():
         src_ip  = info.get("src_ip")
@@ -764,17 +791,17 @@ def create_botnet_event_and_push(misp, sessions, ts_suffix):
         urls    = info.get("urls", [])
         dloads  = info.get("downloads", [])
         ts_first = info.get("ts_first")
-        cmt = fmt_comment(src_ip, sid, ts_first)  # <-- tái dùng helper sẵn có
+        cmt = fmt_comment(src_ip, sid, ts_first)
 
         # ip-src
         add_attr_safe(misp, event_id, "ip-src", src_ip, "Network activity", cmt, True)
 
-        # credentials (không to_ids)
+        # creds (không to_ids)
         if user or passwd:
             cred_val = f"{user or ''}:{passwd or ''}"
             add_attr_safe(misp, event_id, "text", cred_val, "Other", cmt, False)
 
-        # URLs / domain / ip-dst
+        # URL / domain / ip-dst
         for u in urls:
             add_attr_safe(misp, event_id, "url", u, "Payload delivery", cmt, True)
             try:
@@ -788,7 +815,7 @@ def create_botnet_event_and_push(misp, sessions, ts_suffix):
             except Exception as e:
                 logger.warning(f"URL enrich failed for {u}: {e}")
 
-        # Hash sample (ưu tiên shasum của Cowrie; nếu không có và cho phép thì fetch)
+        # hash (ưu tiên shasum)
         for d in dloads:
             u = d.get("url"); sh = d.get("shasum")
             if sh:
@@ -799,6 +826,7 @@ def create_botnet_event_and_push(misp, sessions, ts_suffix):
                     add_attr_safe(misp, event_id, "sha256", h, "Artifacts dropped", cmt, True)
 
     return event_id
+
 
 
 
