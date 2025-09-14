@@ -171,7 +171,7 @@ def correlate_sessions(events):
             o["src_ip"] = str(ip)
 
         ev = s.get("eventid") or ""
-        if ev.endswith("login.success"):
+        if ev.endswith("cowrie.login.success"):
             if s.get("username"):
                 o["username"] = str(s["username"])
             if s.get("password"):
