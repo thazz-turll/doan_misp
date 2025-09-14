@@ -1,25 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import re
-import sys
-import logging
+import os, sys, re, logging, hashlib, socket
 from logging.handlers import RotatingFileHandler
 from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 from urllib.parse import urlparse
 
 import pandas as pd
-from elasticsearch import Elasticsearch
-from elasticsearch import TransportError, ConnectionError as ESConnectionError
-from requests.exceptions import RequestException
-from pymisp import PyMISP, MISPEvent
-import time, random
 import urllib3
+from elasticsearch import Elasticsearch
+from pymisp import PyMISP, MISPEvent
+
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ===== Load ENV =====
+# ================== ENV ==================
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -30,331 +25,287 @@ ES_URL   = os.getenv("ES_URL")
 MISP_URL = os.getenv("MISP_URL")
 MISP_KEY = os.getenv("MISP_KEY")
 ES_INDEX = os.getenv("ES_INDEX", "logstash-*")
+
+# Khoảng thời gian truy vấn log
 HOURS_LOOKBACK = int(os.getenv("HOURS_LOOKBACK", "12"))
 
+# Bật/tắt verify SSL với MISP
 VERIFY_SSL = os.getenv("MISP_VERIFY_SSL", "false").lower() == "true"
-EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
 
+# Tiêu đề event
+EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Scenario 3)")
+
+# Danh sách IP an toàn cần bỏ qua (CSV)
 SAFE_IPS = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 
-missing = []
-for k, v in {"ES_URL": ES_URL, "MISP_URL": MISP_URL, "MISP_KEY": MISP_KEY}.items():
-    if not v:
-        missing.append(k)
+# Cho phép tải mẫu để băm SHA256 (CHỈ LAB!)
+ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
+SAMPLE_MAX_BYTES = int(os.getenv("SAMPLE_MAX_BYTES", "5242880"))  # 5MB giới hạn an toàn
+
+# Log file
+LOG_FILE = os.getenv("LOG_FILE", "scenario3_botnet_detect.log")
+
+# Bắt buộc
+missing = [k for k, v in {"ES_URL": ES_URL, "MISP_URL": MISP_URL, "MISP_KEY": MISP_KEY}.items() if not v]
 if missing:
     sys.stderr.write(f"[CONFIG ERROR] Missing required env: {', '.join(missing)}\n")
     sys.exit(1)
 
-# ===== Logging =====
-LOG_FILE = os.getenv("LOG_FILE", "botnet_cowrie_detect.log")
-logger = logging.getLogger("botnet-cowrie-detect")
+# ================== Logging ==================
+logger = logging.getLogger("scenario3-botnet")
 logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=1048576, backupCount=3, encoding="utf-8")
+handler = RotatingFileHandler(LOG_FILE, maxBytes=2*1024*1024, backupCount=3, encoding="utf-8")
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(handler)
 
-# ===== Helpers (tối giản, theo form code chính) =====
-MD5_RE    = re.compile(r"^[a-fA-F0-9]{32}$")
-SHA1_RE   = re.compile(r"^[a-fA-F0-9]{40}$")
-SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
-SHA512_RE = re.compile(r"^[a-fA-F0-9]{128}$")
+# ================== ES Helpers ==================
+def es_client():
+    return Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
 
-LABELED_HASH_RE = re.compile(r"(?i)\b(md5|sha1|sha256|sha512)\s*[:=]\s*([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b")
-BARE_HASH_RE    = re.compile(r"\b([A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}|[A-Fa-f0-9]{128})\b")
-
-URL_RE = re.compile(r"\bhttps?://[^\s\"']{4,}\b", re.IGNORECASE)
-
-def classify_hash(h: str):
-    v = (h or "").strip()
-    if MD5_RE.fullmatch(v): return "md5"
-    if SHA1_RE.fullmatch(v): return "sha1"
-    if SHA256_RE.fullmatch(v): return "sha256"
-    if SHA512_RE.fullmatch(v): return "sha512"
-    return None
-
-def normalize_url(u: str) -> str:
-    u = str(u or "").strip()
-    try:
-        p = urlparse(u)
-        netloc = p.netloc.lower()
-        return f"{p.scheme}://{netloc}{p.path or ''}{('?' + p.query) if p.query else ''}"
-    except Exception:
-        return u
-
-def first(v):
-    if isinstance(v, list) and v:
-        return v[0]
-    return v
-
-def many(v):
-    if isinstance(v, list):
-        return v
-    return [v] if v is not None else []
-
-def _is_retryable_exc(e):
-    if isinstance(e, (ESConnectionError, TransportError)):
-        status = getattr(e, "status_code", None) or getattr(e, "status", None)
-        if status in (429, 500, 502, 503, 504) or status is None:
-            return True
-        return False
-    if isinstance(e, RequestException):
-        return True
-    return False
-
-def with_retry(func, *, max_attempts=5, base=0.5, cap=8.0, who="op"):
-    attempt = 0
-    while True:
-        try:
-            return func()
-        except Exception as e:
-            attempt += 1
-            if not _is_retryable_exc(e) or attempt >= max_attempts:
-                logger.error(f"[{who}] FAILED after {attempt} attempts: {e}")
-                raise
-            delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, base)
-            logger.warning(f"[{who}] attempt {attempt} failed: {e} → retry in {delay:.2f}s")
-            time.sleep(delay)
-
-# ===== ES fetch (chỉ Cowrie) =====
-ES_SOURCE_FIELDS = [
-    "@timestamp",
-    "source.ip","src_ip",
-    "user.name","username","password",
-    # Cowrie/command/message/url
-    "message","cowrie.session","cowrie.command","cowrie.input","request",
-    "url","http.url","url.full","url.original","url.domain","http.hostname","hostname","domain",
-    "md5","sha1","sha256","sha512","hash","hashes",
-    "event.dataset","event.module","program","tags"
-]
-
-def fetch_cowrie_iocs_from_es():
-    """
-    Truy vấn ES lấy log liên quan Cowrie trong HOURS_LOOKBACK.
-    Trích xuất IoC (ip, credential, url, hash) theo từng IP nguồn.
-    Trả về dict: ip -> {"creds": set, "urls": set, "hashes": set, "last_ts": str}
-    """
-    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
-    esq = es.options(request_timeout=60)
-
+def time_range_clause(hours):
     now = datetime.now(timezone.utc)
-    start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
+    start = (now - relativedelta(hours=hours)).isoformat()
+    return {"range": {"@timestamp": {"gte": start}}}
 
-    base_query = {
-        "_source": ES_SOURCE_FIELDS,
-        "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
+def fetch_cowrie_events():
+    """
+    Lấy events liên quan kịch bản:
+      - cowrie.login.success   (để lấy username/password + session + src_ip)
+      - cowrie.command.input   (để trích URL từ lệnh curl/wget)
+      - cowrie.session.file_download (để lấy url + shasum)
+    Thêm bộ lọc gợi ý của bạn:
+      eventid wildcard "cowrie.*", term type = "Cowrie", path.keyword chứa "cowrie".
+    """
+    es = es_client()
+    q = {
+        "_source": [
+            "@timestamp", "eventid", "session", "src_ip", "source.ip",
+            "username", "password", "message", "args", "url", "shasum",
+            "path", "type"
+        ],
         "query": {
             "bool": {
-                "must": [{"range": {"@timestamp": {"gte": start}}}],
+                "must": [ time_range_clause(HOURS_LOOKBACK) ],
                 "should": [
-                    {"term": {"event.dataset": "cowrie"}},
-                    {"term": {"event.module":  "cowrie"}},
-                    {"term": {"program":       "cowrie"}},
-                    {"match_phrase": {"message": "cowrie"}},
-                    {"term": {"tags":          "cowrie"}}
+                    {"wildcard": {"eventid.keyword": "cowrie.*"}},
+                    {"term": {"type.keyword": "Cowrie"}},
+                    {"wildcard": {"path.keyword": "*cowrie*"}}
                 ],
                 "minimum_should_match": 1
             }
-        }
+        },
+        "size": 10000,
+        "sort": [{"@timestamp": {"order": "asc"}}]
     }
+    resp = es.search(index=ES_INDEX, body=q)
+    hits = resp.get("hits", {}).get("hits", [])
+    return [h.get("_source", {}) for h in hits]
 
-    page_size = 3000
-    search_after = None
+# ================== Parse Helpers ==================
+URL_RGX = re.compile(r"""(?P<url>(?:https?|ftp)://[^\s'"]+)""", re.IGNORECASE)
 
-    bucket = {}  # ip -> dict(creds=set(), urls=set(), hashes=set(), last_ts=str)
-    def ensure_ip(ip):
-        if ip not in bucket:
-            bucket[ip] = {"creds": set(), "urls": set(), "hashes": set(), "last_ts": ""}
+def extract_urls_from_command(msg, args):
+    texts = []
+    if isinstance(msg, str):
+        texts.append(msg)
+    if isinstance(args, list):
+        texts.extend([str(a) for a in args])
+    elif isinstance(args, str):
+        texts.append(args)
+    urls = set()
+    for t in texts:
+        for m in URL_RGX.finditer(t):
+            urls.add(m.group("url").strip(";\"' )("))
+    return list(urls)
 
-    while True:
-        body = dict(base_query)
-        body["size"] = page_size
-        if search_after:
-            body["search_after"] = search_after
-        body["track_total_hits"] = False
-
-        resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search.cowrie")
-        hits = resp.get("hits", {}).get("hits", [])
-        if not hits:
-            break
-
-        for hit in hits:
-            s = hit.get("_source", {}) or {}
-            ts = first(s.get("@timestamp"))
-            src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
-            if not src_ip:
-                continue
-            src_ip = str(src_ip).strip()
-            ensure_ip(src_ip)
-
-            # update last_ts
-            if ts:
-                cur = bucket[src_ip]["last_ts"]
-                bucket[src_ip]["last_ts"] = cur or ts
-
-            # Credentials
-            u = first(s.get("user.name")) or first(s.get("username"))
-            p = first(s.get("password"))
-            if u or p:
-                bucket[src_ip]["creds"].add(f"{u or ''}:{p or ''}")
-
-            # Hash (field)
-            for fld in ["md5","sha1","sha256","sha512","hash"]:
-                for v in many(s.get(fld)):
-                    v2 = str(v or "").strip()
-                    if classify_hash(v2):
-                        bucket[src_ip]["hashes"].add(v2)
-
-            # Hash trong message/hashes
-            text_buf = []
-            for fld in ["hashes","message","cowrie.command","cowrie.input","request"]:
-                for v in many(s.get(fld)):
-                    if v:
-                        text_buf.append(str(v))
-            if text_buf:
-                merged = "\n".join(text_buf)
-                labeled_found = False
-                for _, h in LABELED_HASH_RE.findall(merged):
-                    if classify_hash(h):
-                        bucket[src_ip]["hashes"].add(h)
-                        labeled_found = True
-                if not labeled_found:
-                    for h in BARE_HASH_RE.findall(merged):
-                        if classify_hash(h):
-                            bucket[src_ip]["hashes"].add(h)
-
-            # URL structured fields
-            for fld in ["url.full","url.original","http.url","url"]:
-                for v in many(s.get(fld)):
-                    if not v: continue
-                    u2 = normalize_url(str(v))
-                    if u2.lower().startswith(("http://","https://")):
-                        bucket[src_ip]["urls"].add(u2)
-
-            # URL từ message
-            for v in many(s.get("message")):
-                if not v: continue
-                for m in URL_RE.findall(str(v)):
-                    u2 = normalize_url(m)
-                    if u2.lower().startswith(("http://","https://")):
-                        bucket[src_ip]["urls"].add(u2)
-
-        search_after = hits[-1]["sort"]
-        if len(hits) < page_size:
-            break
-
-    return bucket
-
-# ===== MISP push =====
-def create_event(misp: PyMISP, title: str) -> str:
-    ev = MISPEvent()
-    ev.info            = title
-    ev.distribution    = int(os.getenv("MISP_DISTRIBUTION", "0"))
-    ev.analysis        = int(os.getenv("MISP_ANALYSIS", "0"))
-    ev.threat_level_id = int(os.getenv("MISP_THREAT_LEVEL_ID", "2"))
-    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event")
+def resolve_ip(host):
     try:
-        return str(res["Event"]["id"])
+        return socket.gethostbyname(host)
     except Exception:
-        return str(getattr(res, "id", None) or getattr(getattr(res, "Event", None), "id", None))
+        return None
 
-def push_botnet_iocs(misp: PyMISP, event_id: str, data: dict):
+def safe_fetch_sha256(url):
+    """TUỲ CHỌN LAB: tải file để băm SHA256 (giới hạn kích thước)."""
+    import requests
+    try:
+        with requests.get(url, timeout=8, stream=True, verify=False) as r:
+            r.raise_for_status()
+            h = hashlib.sha256()
+            total = 0
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > SAMPLE_MAX_BYTES:
+                    logger.warning(f"Skip hashing (size>{SAMPLE_MAX_BYTES}) for {url}")
+                    return None
+                h.update(chunk)
+            return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"Hash fetch failed for {url}: {e}")
+        return None
+
+# ================== Correlate by session ==================
+def correlate_sessions(events):
     """
-    data: ip -> {"creds": set, "urls": set, "hashes": set, "last_ts": str}
+    Trả về dict session -> thông tin:
+      {
+        'src_ip': ..., 'username': ..., 'password': ...,
+        'urls': [..], 'downloads': [{'url':..., 'shasum':...}, ...]
+      }
     """
-    added = 0
-    for ip, info in data.items():
-        # IP nguồn
-        attr_ip = {
-            "type": "ip-src",
-            "category": "Network activity",
-            "value": ip,
-            "to_ids": True,
-            "comment": f"cowrie; ts={info.get('last_ts','')}"
-        }
-        with_retry(lambda: misp.add_attribute(event_id, attr_ip, pythonify=True), who="misp.add_attribute.ip")
-        added += 1
+    sessions = {}
 
-        # Credentials (text, không IDS)
-        for cred in sorted(info["creds"]):
-            if cred.strip() == ":":
-                continue
-            attr_cred = {
-                "type": "text",
-                "category": "Other",
-                "value": cred,
-                "to_ids": False,
-                "comment": f"cowrie credential; src_ip={ip}; ts={info.get('last_ts','')}"
-            }
-            with_retry(lambda: misp.add_attribute(event_id, attr_cred, pythonify=True), who="misp.add_attribute.cred")
-            added += 1
+    for s in events:
+        sess = s.get("session")
+        if not sess:
+            # 1 số log có thể thiếu session, bỏ qua để tránh nhầm
+            continue
+        o = sessions.setdefault(sess, {"src_ip": None, "username": None, "password": None,
+                                       "urls": set(), "downloads": []})
 
-        # URLs (Network activity)
-        for u in sorted(info["urls"]):
-            attr_url = {
-                "type": "url",
-                "category": "Network activity",
-                "value": u,
-                "to_ids": True,
-                "comment": f"cowrie url; src_ip={ip}; ts={info.get('last_ts','')}"
-            }
-            with_retry(lambda: misp.add_attribute(event_id, attr_url, pythonify=True), who="misp.add_attribute.url")
-            added += 1
+        # src_ip
+        ip = s.get("src_ip") or s.get("source.ip")
+        if ip:
+            o["src_ip"] = str(ip)
 
-        # Hashes (Payload delivery)
-        for h in sorted(info["hashes"]):
-            htype = classify_hash(h)
-            if not htype:
-                continue
-            attr_h = {
-                "type": htype,
-                "category": "Payload delivery",
-                "value": h,
-                "to_ids": True,
-                "comment": f"cowrie sample hash; src_ip={ip}; ts={info.get('last_ts','')}"
-            }
-            with_retry(lambda: misp.add_attribute(event_id, attr_h, pythonify=True), who="misp.add_attribute.hash")
-            added += 1
+        ev = s.get("eventid") or ""
+        # login success
+        if ev.endswith("login.success"):
+            if s.get("username"):
+                o["username"] = str(s["username"])
+            if s.get("password"):
+                o["password"] = str(s["password"])
 
-    return added
+        # command input -> trích url
+        if ev.endswith("command.input"):
+            urls = extract_urls_from_command(s.get("message"), s.get("args"))
+            for u in urls:
+                o["urls"].add(u)
 
-# ===== main =====
+        # file download -> url + shasum
+        if ev.endswith("session.file_download"):
+            u = s.get("url")
+            sh = s.get("shasum")
+            if u:
+                o["downloads"].append({"url": u, "shasum": sh})
+                o["urls"].add(u)
+
+    # Đổi set->list
+    for k in sessions:
+        sessions[k]["urls"] = list(sessions[k]["urls"])
+    return sessions
+
+# ================== MISP Helpers ==================
+def misp_client():
+    return PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
+
+def create_event(misp: PyMISP, title: str):
+    ev = MISPEvent()
+    ev.info = title
+    ev.distribution = 0            # org-only
+    ev.analysis = 0                # initial
+    ev.threat_level_id = 2         # medium
+    res = misp.add_event(ev)
+    return str(res["Event"]["id"])
+
+def add_attr(misp, event_id, type_, value, category="Network activity", comment="", to_ids=True):
+    attr = {"type": type_, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
+    misp.add_attribute(event_id, attr, pythonify=True)
+    logger.info(f"ADD {type_} {value} -> event {event_id}")
+
+# ================== Main ==================
 def main():
-    # 1) Lấy IoC Botnet từ ES (Cowrie only)
-    bucket = fetch_cowrie_iocs_from_es()
-    if not bucket:
-        print("[!] Không phát hiện Botnet (Cowrie) trong log.")
+    # B1: Lấy log Cowrie
+    events = fetch_cowrie_events()
+    if not events:
+        print("[!] Không có sự kiện Cowrie trong khoảng thời gian chỉ định.")
         return
 
-    # 2) Lọc SAFE_IPS (nếu có)
-    if SAFE_IPS:
-        bucket = {ip: v for ip, v in bucket.items() if ip not in SAFE_IPS}
-        if not bucket:
-            print("[!] Không phát hiện Botnet (Cowrie) trong log (hoặc chỉ thấy IP thuộc SAFE_IPS).")
-            return
+    # B2: Tương quan theo session
+    sessions = correlate_sessions(events)
 
-    # 3) Kiểm tra có thực sự có IoC đáng giá không (ít nhất có ip hoặc url/hash/cred)
-    #    Trong bucket luôn có ip key; ta giữ nếu có bất kỳ IoC nào hơn IP trống.
-    cleaned = {}
-    for ip, info in bucket.items():
-        if info["creds"] or info["urls"] or info["hashes"] or ip:
-            cleaned[ip] = info
+    # B3: Lọc các phiên có dấu hiệu botnet (login success + có URL tải/cmd)
+    suspects = []
+    for sess_id, info in sessions.items():
+        ip = info.get("src_ip")
+        if not ip or ip in SAFE_IPS:
+            continue
+        weak_cred = bool(info.get("username") or info.get("password"))
+        has_url = len(info.get("urls", [])) > 0 or len(info.get("downloads", [])) > 0
+        if weak_cred and has_url:
+            suspects.append((sess_id, info))
 
-    if not cleaned:
-        print("[!] Không phát hiện Botnet (Cowrie) trong log.")
+    if not suspects:
+        print("[!] Chưa thấy phiên botnet phù hợp (login thành công + tải payload).")
         return
 
-    # 4) Kết nối MISP & tạo event riêng cho kịch bản 3
-    misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
-    event_id = create_event(misp, EVENT_TITLE_BOTNET)
-    if not event_id:
-        print("[!] Không tạo được MISP Event cho Botnet (Cowrie).")
-        return
+    # B4: Tạo MISP event
+    ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    title = f"{EVENT_TITLE_BOTNET} - {ts}"
+    misp = misp_client()
+    event_id = create_event(misp, title)
+    print(f"[+] Created Event {event_id} - {title}")
 
-    print(f"[+] Created Event {event_id} - {EVENT_TITLE_BOTNET}")
+    # B5: Đẩy IoC cho từng phiên nghi vấn
+    for sess_id, info in suspects:
+        src_ip = info.get("src_ip")
+        username = info.get("username")
+        password = info.get("password")
+        urls = info.get("urls", [])
+        downloads = info.get("downloads", [])
 
-    # 5) Đẩy IoC
-    added = push_botnet_iocs(misp, event_id, cleaned)
-    print(f"[+] Done. Added {added} attribute(s) to Event {event_id}.")
+        # ip-src (attacker)
+        if src_ip:
+            add_attr(misp, event_id, "ip-src", src_ip,
+                     category="Network activity",
+                     comment=f"Attacker IP (Cowrie session {sess_id})")
+
+        # username/password yếu
+        if username:
+            add_attr(misp, event_id, "username", username,
+                     category="Payload delivery",
+                     comment=f"Credential used (session {sess_id})", to_ids=False)
+        if password:
+            add_attr(misp, event_id, "password", password,
+                     category="Payload delivery",
+                     comment=f"Credential used (session {sess_id})", to_ids=False)
+
+        # URL/C2 + domain/ip-dst
+        for u in urls:
+            add_attr(misp, event_id, "url", u,
+                     category="Payload delivery",
+                     comment=f"Payload URL observed in commands (session {sess_id})")
+            try:
+                p = urlparse(u)
+                if p.hostname:
+                    add_attr(misp, event_id, "domain", p.hostname,
+                             category="Network activity",
+                             comment=f"C2 host from URL (session {sess_id})")
+                    dst_ip = resolve_ip(p.hostname)
+                    if dst_ip:
+                        add_attr(misp, event_id, "ip-dst", dst_ip,
+                                 category="Network activity",
+                                 comment=f"Resolved C2 IP (session {sess_id})")
+            except Exception:
+                pass
+
+        # SHA256 từ Cowrie hoặc tự tính (nếu bật)
+        for d in downloads:
+            u = d.get("url")
+            sh = d.get("shasum")
+            if sh:
+                add_attr(misp, event_id, "sha256", sh,
+                         category="Artifacts dropped",
+                         comment=f"File hash reported by Cowrie (session {sess_id})")
+            elif ALLOW_SAMPLE_FETCH and u:
+                h = safe_fetch_sha256(u)
+                if h:
+                    add_attr(misp, event_id, "sha256", h,
+                             category="Artifacts dropped",
+                             comment=f"SHA256 computed in LAB (session {sess_id})")
+
+    print(f"[+] Done. Pushed {len(suspects)} session(s) worth of IoCs to MISP.")
 
 if __name__ == "__main__":
     main()
