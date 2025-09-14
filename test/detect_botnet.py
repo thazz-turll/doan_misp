@@ -10,7 +10,6 @@ from logging.handlers import RotatingFileHandler
 import urllib3
 from elasticsearch import Elasticsearch
 from pymisp import PyMISP, MISPEvent
-from requests.exceptions import RequestException
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -32,7 +31,7 @@ EVENT_TITLE    = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowr
 SAFE_IPS = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
 SAMPLE_MAX_BYTES   = int(os.getenv("SAMPLE_MAX_BYTES", "5242880"))
-DRY_RUN   = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 if not ES_URL or not MISP_URL or not MISP_KEY:
     sys.stderr.write("[CONFIG ERROR] Missing required env\n")
@@ -44,7 +43,7 @@ handler = RotatingFileHandler("scenario3_botnet_detect.log", maxBytes=2*1024*102
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(handler)
 
-URL_RGX = re.compile(r"""(?P<url>(?:https?|ftp)://[^\s'"]+)""", re.IGNORECASE)
+URL_RGX = re.compile(r"(?P<url>(?:https?|ftp)://[^\s'\"<>]+)", re.IGNORECASE)
 LOGIN_SUCC_RGX = re.compile(r'login attempt \[([^/\]]+)/([^\]]+)\]\s+succeeded', re.IGNORECASE)
 IP_HOST_RGX = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 
@@ -59,12 +58,23 @@ def time_range_clause(hours):
 def fetch_cowrie_events():
     es = es_client()
     q = {
-        "_source": ["@timestamp","eventid","session","src_ip","source.ip","username","user.name","password","message","args","url","shasum","path","type"],
+        "_source": [
+            "@timestamp","eventid","session",
+            "src_ip","source.ip",
+            "username","user.name","password",
+            "message","args",
+            "url","shasum",
+            "path","type"
+        ],
         "query": {
             "bool": {
                 "must": [ time_range_clause(HOURS_LOOKBACK) ],
                 "should": [
-                    {"terms": {"eventid.keyword": ["cowrie.login.success","cowrie.command.input","cowrie.session.file_download"]}},
+                    {"terms": {"eventid.keyword": [
+                        "cowrie.login.success",
+                        "cowrie.command.input",
+                        "cowrie.session.file_download"
+                    ]}},
                     {"term": {"type.keyword": "Cowrie"}},
                     {"wildcard": {"path.keyword": "*cowrie*"}}
                 ],
@@ -112,9 +122,11 @@ def correlate_sessions(events):
     for s in events:
         sess = s.get("session")
         if not sess: continue
-        o = sessions.setdefault(sess, {"src_ip": None,"username": None,"password": None,"urls": set(),"downloads": []})
+        o = sessions.setdefault(sess, {"src_ip": None,"username": None,"password": None,"urls": set(),"downloads": [], "ts_first": None})
         ip = s.get("src_ip") or s.get("source.ip")
         if ip: o["src_ip"] = str(ip)
+        ts = s.get("@timestamp")
+        if ts and not o["ts_first"]: o["ts_first"] = ts
         ev = (s.get("eventid") or "").lower()
         if ev.endswith("login.success"):
             u = s.get("username") or s.get("user.name")
@@ -141,10 +153,18 @@ def misp_client():
     return PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
 
 def create_event(misp: PyMISP, title: str):
-    ev = MISPEvent(); ev.info = title; ev.distribution = 0; ev.analysis = 0; ev.threat_level_id = 2
-    if DRY_RUN: return "DRY_EVENT_ID"
+    ev = MISPEvent()
+    ev.info = title
+    ev.distribution = 0
+    ev.analysis = 0
+    ev.threat_level_id = 2
+    if DRY_RUN:
+        return "DRY_EVENT_ID"
     res = misp.add_event(ev)
-    return str(res["Event"]["id"])
+    try:
+        return str(res["Event"]["id"])
+    except Exception:
+        return str(getattr(res, "id", "UNKNOWN"))
 
 def _misp_add_attr_raw(misp, event_id, type_, value, category="Network activity", comment="", to_ids=True):
     if not value or str(value).strip() == "": return None
@@ -160,12 +180,28 @@ def add_attr_safe(misp, event_id, pref_type, value, category, comment, to_ids=Tr
         if "Invalid type" in str(e) or "403" in str(e):
             _misp_add_attr_raw(misp, event_id, "text", value, category, f"{comment} [fallback text]", to_ids=False)
 
+def fmt_comment(src_ip: str, sess_id: str, ts_iso: str | None = None) -> str:
+    try:
+        if ts_iso:
+            from dateutil import parser as dtparser
+            dt = dtparser.isoparse(ts_iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            ts_local = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        else:
+            ts_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    except Exception:
+        ts_local = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+    return f"src_ip={src_ip}; ts={ts_local}; session={sess_id}"
+
 def main():
     events = fetch_cowrie_events()
     if not events:
         print("[!] Không có sự kiện Cowrie.")
         return
+
     sessions = correlate_sessions(events)
+
     suspects = []
     for sess_id, info in sessions.items():
         ip = info.get("src_ip")
@@ -173,42 +209,69 @@ def main():
         if not (info.get("username") or info.get("password")): continue
         has_url = bool(info.get("urls")) or bool(info.get("downloads"))
         suspects.append((sess_id, info, has_url))
+
     if not suspects:
-        print("[!] Không có phiên nghi ngờ.")
+        print("[!] Không có phiên login thành công hợp lệ.")
         return
+
     ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     title = f"{EVENT_TITLE} - {ts}"
     misp = None if DRY_RUN else misp_client()
     event_id = create_event(misp if misp else PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL), title)
     print(f"[+] Created Event {event_id} - {title}")
+
     for sess_id, info, has_url in suspects:
-        src_ip  = info.get("src_ip"); user = info.get("username"); passwd = info.get("password")
-        urls    = info.get("urls", []); dloads  = info.get("downloads", [])
-        add_attr_safe(misp, event_id, "ip-src", src_ip, "Network activity", f"Attacker IP (session {sess_id})", True)
+        src_ip  = info.get("src_ip")
+        user    = info.get("username")
+        passwd  = info.get("password")
+        urls    = info.get("urls", [])
+        dloads  = info.get("downloads", [])
+        ts_first = info.get("ts_first")
+
+        cmt = fmt_comment(src_ip, sess_id, ts_first)
+
+        add_attr_safe(misp, event_id, "ip-src", src_ip,
+                      "Network activity", cmt, True)
+
         if user or passwd:
             cred_val = f"{user or ''}:{passwd or ''}"
-            add_attr_safe(misp, event_id, "text", cred_val, "Other", f"credential (session {sess_id})", False)
+            add_attr_safe(misp, event_id, "text", cred_val,
+                          "Other", cmt, False)
+
         if has_url:
             for u in urls:
-                add_attr_safe(misp, event_id, "url", u, "Payload delivery", f"Payload URL (session {sess_id})", True)
+                add_attr_safe(misp, event_id, "url", u,
+                              "Payload delivery", cmt, True)
                 try:
-                    p = urlparse(u); host = p.hostname
+                    p = urlparse(u)
+                    host = p.hostname
                     if host and not IP_HOST_RGX.match(host):
-                        add_attr_safe(misp, event_id, "domain", host, "Network activity", f"C2 host (session {sess_id})", True)
+                        add_attr_safe(misp, event_id, "domain", host,
+                                      "Network activity", cmt, True)
                     dst_ip = resolve_ip(host) if host else None
                     if dst_ip:
-                        add_attr_safe(misp, event_id, "ip-dst", dst_ip, "Network activity", f"C2 IP (session {sess_id})", True)
-                except: pass
+                        add_attr_safe(misp, event_id, "ip-dst", dst_ip,
+                                      "Network activity", cmt, True)
+                except Exception:
+                    pass
+
             for d in dloads:
-                u = d.get("url"); sh = d.get("shasum")
+                u = d.get("url")
+                sh = d.get("shasum")
                 if sh:
-                    add_attr_safe(misp, event_id, "sha256", sh, "Artifacts dropped", f"File hash (session {sess_id})", True)
+                    add_attr_safe(misp, event_id, "sha256", sh,
+                                  "Artifacts dropped", cmt, True)
                 elif ALLOW_SAMPLE_FETCH and u:
                     h = safe_fetch_sha256(u)
                     if h:
-                        add_attr_safe(misp, event_id, "sha256", h, "Artifacts dropped", f"SHA256 (session {sess_id})", True)
+                        add_attr_safe(misp, event_id, "sha256", h,
+                                      "Artifacts dropped", cmt, True)
+
     print(f"[+] Done. {len(suspects)} session(s) pushed.")
 
 if __name__ == "__main__":
-    try: main()
-    except Exception as e: sys.stderr.write(f"[FATAL] {e}\n"); sys.exit(2)
+    try:
+        main()
+    except Exception as e:
+        sys.stderr.write(f"[FATAL] {e}\n")
+        sys.exit(2)
