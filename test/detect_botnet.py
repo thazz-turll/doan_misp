@@ -31,7 +31,6 @@ EVENT_TITLE    = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowr
 SAFE_IPS = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
 SAMPLE_MAX_BYTES   = int(os.getenv("SAMPLE_MAX_BYTES", "5242880"))
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"
 
 if not ES_URL or not MISP_URL or not MISP_KEY:
     sys.stderr.write("[CONFIG ERROR] Missing required env\n")
@@ -106,7 +105,7 @@ def resolve_ip(host):
 def safe_fetch_sha256(url):
     import requests
     try:
-        with requests.get(url, timeout=8, stream=True, verify=False) as r:
+        with requests.get(url, timeout=8, stream=True, verify=VERIFY_SSL) as r:
             r.raise_for_status()
             h = hashlib.sha256(); total = 0
             for chunk in r.iter_content(chunk_size=8192):
@@ -158,8 +157,6 @@ def create_event(misp: PyMISP, title: str):
     ev.distribution = 0
     ev.analysis = 0
     ev.threat_level_id = 2
-    if DRY_RUN:
-        return "DRY_EVENT_ID"
     res = misp.add_event(ev)
     try:
         return str(res["Event"]["id"])
@@ -169,7 +166,6 @@ def create_event(misp: PyMISP, title: str):
 def _misp_add_attr_raw(misp, event_id, type_, value, category="Network activity", comment="", to_ids=True):
     if not value or str(value).strip() == "": return None
     payload = {"type": type_, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
-    if DRY_RUN: return None
     return misp.add_attribute(event_id, payload, pythonify=True)
 
 def add_attr_safe(misp, event_id, pref_type, value, category, comment, to_ids=True):
@@ -214,10 +210,12 @@ def main():
         print("[!] Không có phiên login thành công hợp lệ.")
         return
 
-    ts = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    title = f"{EVENT_TITLE} - {ts}"
-    misp = None if DRY_RUN else misp_client()
-    event_id = create_event(misp if misp else PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL), title)
+    # BỎ GIỜ–PHÚT–GIÂY KHỎI TIÊU ĐỀ EVENT: chỉ giữ ngày YYYY-MM-DD
+    ts_date = datetime.now().astimezone().strftime("%Y-%m-%d")
+    title = f"{EVENT_TITLE} - {ts_date}"
+
+    misp = misp_client()
+    event_id = create_event(misp, title)
     print(f"[+] Created Event {event_id} - {title}")
 
     for sess_id, info, has_url in suspects:
