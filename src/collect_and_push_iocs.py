@@ -81,6 +81,13 @@ SHA1_RE   = re.compile(r"^[a-fA-F0-9]{40}$")
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 SHA512_RE = re.compile(r"^[a-fA-F0-9]{128}$")
 
+
+# ==== Regex & constants (THÊM cho Cowrie) ====
+URL_RGX         = re.compile(r"(?P<url>(?:https?|ftp)://[^\s'\"<>]+)", re.IGNORECASE)
+LOGIN_SUCC_RGX  = re.compile(r'login attempt \[([^/\]]+)/([^\]]+)\]\s+succeeded', re.IGNORECASE)
+IP_HOST_RGX     = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
+
 # có nhãn: md5: <...>, sha1=..., sha256:..., sha512=...
 LABELED_HASH_RE = re.compile(
     r"(?i)\b(md5|sha1|sha256|sha512)\s*[:=]\s*([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b"
@@ -111,7 +118,13 @@ RETRY_CAP  = float(os.getenv("RETRY_CAP", "8"))      # giây
 RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
 
 # ===== Helpers =====
+# ==== BOTNET / COWRIE DETECTION (ENV) ====
+DETECT_BOTNET      = os.getenv("DETECT_BOTNET", "true").lower() == "true"
+EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
 
+# reuse HOURS_LOOKBACK đã có; nếu code chính đặt khác, ưu tiên cái hiện có
+ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
+SAMPLE_MAX_BYTES   = int(os.getenv("SAMPLE_MAX_BYTES", "5242880"))
 
 
 DETECT_NMAP      = os.getenv("DETECT_NMAP", "false").lower() == "true"
@@ -466,6 +479,123 @@ def detect_ddos_sources(conns, threshold: int):
     return [ip for ip in suspects if ip not in SAFE_IPS]
 
 
+
+
+def fetch_cowrie_events():
+    """Lấy log Cowrie trong khung thời gian HOURS_LOOKBACK."""
+    es = es_client()
+    body = {
+        "_source": [
+            "@timestamp","eventid","session",
+            "src_ip","source.ip",
+            "username","user.name","password",
+            "message","args",
+            "url","shasum",
+            "path","type"
+        ],
+        "query": {
+            "bool": {
+                "must": [ time_range_clause(HOURS_LOOKBACK) ],
+                "should": [
+                    {"terms": {"eventid.keyword": [
+                        "cowrie.login.success",
+                        "cowrie.command.input",
+                        "cowrie.session.file_download"
+                    ]}},
+                    {"term": {"type.keyword": "Cowrie"}},
+                    {"wildcard": {"path.keyword": "*cowrie*"}}
+                ],
+                "minimum_should_match": 1
+            }
+        },
+        "size": 10000,
+        "sort": [{"@timestamp": {"order": "asc"}}]
+    }
+    resp = es.search(index=ES_INDEX, body=body)
+    hits = resp.get("hits", {}).get("hits", [])
+    return [h.get("_source", {}) for h in hits]
+
+
+def extract_urls_from_command(msg, args):
+    texts = []
+    if isinstance(msg, str): texts.append(msg)
+    if isinstance(args, list): texts.extend([str(a) for a in args])
+    elif isinstance(args, str): texts.append(args)
+    urls = set()
+    for t in texts:
+        for m in URL_RGX.finditer(t):
+            urls.add(m.group("url").strip(";\"' )("))
+    return list(urls)
+
+
+def resolve_ip(host):
+    try:
+        return socket.gethostbyname(host)
+    except Exception:
+        return None
+
+
+def safe_fetch_sha256(url):
+    import requests, hashlib
+    try:
+        with requests.get(url, timeout=8, stream=True, verify=VERIFY_SSL) as r:
+            r.raise_for_status()
+            h = hashlib.sha256(); total = 0
+            for chunk in r.iter_content(chunk_size=8192):
+                if not chunk: continue
+                total += len(chunk)
+                if total > SAMPLE_MAX_BYTES:
+                    logging.getLogger("botnet-detect").warning(
+                        f"Sample too large > {SAMPLE_MAX_BYTES} bytes: {url}"
+                    )
+                    return None
+                h.update(chunk)
+            return h.hexdigest()
+    except Exception as e:
+        logging.getLogger("botnet-detect").warning(f"safe_fetch_sha256 failed for {url}: {e}")
+        return None
+
+
+def correlate_cowrie_sessions(events):
+    """Gom theo session, lấy src_ip/creds/URL/download/time đầu tiên."""
+    sessions = {}
+    for s in events:
+        sid = s.get("session")
+        if not sid: continue
+        o = sessions.setdefault(sid, {"src_ip": None, "username": None, "password": None,
+                                      "urls": set(), "downloads": [], "ts_first": None})
+        ip = s.get("src_ip") or s.get("source.ip")
+        if ip: o["src_ip"] = str(ip)
+        ts = s.get("@timestamp")
+        if ts and not o["ts_first"]: o["ts_first"] = ts
+
+        ev = (s.get("eventid") or "").lower()
+        if ev.endswith("login.success"):
+            u = s.get("username") or s.get("user.name")
+            p = s.get("password")
+            if u: o["username"] = str(u)
+            if p: o["password"] = str(p)
+            if not o["username"] or not o["password"]:
+                m = LOGIN_SUCC_RGX.search(str(s.get("message","")))
+                if m:
+                    o["username"] = o["username"] or m.group(1)
+                    o["password"] = o["password"] or m.group(2)
+
+        if ev.endswith("command.input"):
+            for u in extract_urls_from_command(s.get("message"), s.get("args")):
+                o["urls"].add(u)
+
+        if ev.endswith("session.file_download"):
+            u = s.get("url"); sh = s.get("shasum")
+            if u:
+                o["downloads"].append({"url": u, "shasum": sh})
+                o["urls"].add(u)
+
+    for k in sessions:
+        sessions[k]["urls"] = list(sessions[k]["urls"])
+    return sessions
+
+
 # ===== MISP mapping / push =====
 
 def map_row_to_misp(row):
@@ -600,6 +730,76 @@ def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
         logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
 
+def create_botnet_event_and_push(misp, sessions, ts_suffix):
+    """
+    Tạo event Botnet theo tiêu đề: EVENT_TITLE_BOTNET + ' - ' + ts_suffix
+    và đẩy các thuộc tính (ip-src, domain/url/ip-dst, sha256, creds).
+    """
+    title = f"{EVENT_TITLE_BOTNET} - {ts_suffix}"
+    ev = MISPEvent()
+    ev.info = title
+    ev.distribution = 0
+    ev.analysis = 0
+    ev.threat_level_id = 2
+
+    res = misp.add_event(ev)
+    event_id = str(res["Event"]["id"])
+
+    logger = logging.getLogger("botnet-detect")
+    logger.info(f"[Botnet] Created MISP event id={event_id} title='{title}'")
+
+    # Nếu code chính của bạn có hàm add_tags_to_event(...), gọi ở đây để gắn cùng bộ tags:
+    try:
+        add_tags_to_event(misp, event_id)  # <-- tái dùng nếu đã có
+    except NameError:
+        pass  # bỏ qua nếu code chính chưa có
+
+    for sid, info in sessions.items():
+        src_ip  = info.get("src_ip")
+        if not src_ip or src_ip in SAFE_IPS:
+            continue
+
+        user    = info.get("username")
+        passwd  = info.get("password")
+        urls    = info.get("urls", [])
+        dloads  = info.get("downloads", [])
+        ts_first = info.get("ts_first")
+        cmt = fmt_comment(src_ip, sid, ts_first)  # <-- tái dùng helper sẵn có
+
+        # ip-src
+        add_attr_safe(misp, event_id, "ip-src", src_ip, "Network activity", cmt, True)
+
+        # credentials (không to_ids)
+        if user or passwd:
+            cred_val = f"{user or ''}:{passwd or ''}"
+            add_attr_safe(misp, event_id, "text", cred_val, "Other", cmt, False)
+
+        # URLs / domain / ip-dst
+        for u in urls:
+            add_attr_safe(misp, event_id, "url", u, "Payload delivery", cmt, True)
+            try:
+                p = urlparse(u)
+                host = p.hostname
+                if host and not IP_HOST_RGX.match(host):
+                    add_attr_safe(misp, event_id, "domain", host, "Network activity", cmt, True)
+                dst_ip = resolve_ip(host) if host else None
+                if dst_ip:
+                    add_attr_safe(misp, event_id, "ip-dst", dst_ip, "Network activity", cmt, True)
+            except Exception as e:
+                logger.warning(f"URL enrich failed for {u}: {e}")
+
+        # Hash sample (ưu tiên shasum của Cowrie; nếu không có và cho phép thì fetch)
+        for d in dloads:
+            u = d.get("url"); sh = d.get("shasum")
+            if sh:
+                add_attr_safe(misp, event_id, "sha256", sh, "Artifacts dropped", cmt, True)
+            elif ALLOW_SAMPLE_FETCH and u:
+                h = safe_fetch_sha256(u)
+                if h:
+                    add_attr_safe(misp, event_id, "sha256", h, "Artifacts dropped", cmt, True)
+
+    return event_id
+
 
 
 def create_event(misp: PyMISP, title: str) -> str:
@@ -729,16 +929,14 @@ def main():
     if not VERIFY_SSL:
         logger.warning("MISP SSL verification DISABLED (lab only)")
 
-    # Freeze suffix ngày cho toàn bộ run (đảm bảo Nmap/DDOS trùng ngày với event chính)
+    # 0) Cố định hậu tố thời gian cho toàn bộ run
     ts_suffix = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
 
-    # Override helper để mọi nơi dùng cùng 1 suffix
+    # Cho toàn bộ helper dùng CÙNG một suffix (Nmap/DDoS/Botnet)
     def _fixed_suffix() -> str:
         return ts_suffix
     global _get_ts_suffix_from_daily
     _get_ts_suffix_from_daily = _fixed_suffix
-
-    
 
     # 1) Lấy IoC từ ES
     df = fetch_iocs_from_es()
@@ -747,7 +945,7 @@ def main():
     if df is None or df.empty:
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
 
-    # 2) Kết nối MISP (dùng chung cho push IoC và detection)
+    # 2) Kết nối MISP (dùng chung cho push IoC và các detection)
     misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
 
     # 3) Nếu có IoC thì lấy/tạo event chính + gắn tag + push attribute
@@ -756,26 +954,70 @@ def main():
         logger.info(f"Using Event ID: {event_id}")
         print(f"[+] Using Event ID: {event_id}")
         if MISP_TAGS:
-            tag_event(misp, event_id, MISP_TAGS)
-        added, skipped = push_iocs_to_misp(misp, event_id, df)
-        logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={len(df)}")
-        print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {len(df)}")
+            try:
+                tag_event(misp, event_id, MISP_TAGS)
+            except Exception as e:
+                logger.warning(f"Tag event failed: {e}")
+        try:
+            added, skipped = push_iocs_to_misp(misp, event_id, df)
+            logger.info(f"Done. Added={added} Skipped={skipped} TotalInput={len(df)}")
+            print(f"[+] Done. Added: {added}, Skipped: {skipped}, Total input: {len(df)}")
+        except Exception as e:
+            logger.error(f"Push IoC failed: {e}")
 
-    # 4) Phát hiện Nmap/DDoS → tạo event RIÊNG (đuôi thời gian giống event chính)
+    # 4) Các phát hiện chuyên biệt → tạo event RIÊNG (Nmap/DDoS/Botnet)
     try:
+        # 4.1) Nmap & DDoS dựa trên kết nối (nếu bật)
         conns = fetch_conn_tuples_from_es() if (DETECT_NMAP or DETECT_DDOS) else None
 
         if DETECT_NMAP and conns:
-            suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
-            if suspects_nmap:
-                ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)
-                print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
+            try:
+                suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
+                if suspects_nmap:
+                    ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)  # dùng chung suffix qua helper
+                    print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
+            except Exception as e:
+                logger.error(f"Nmap detection failed: {e}")
 
         if DETECT_DDOS and conns:
-            suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
-            if suspects_ddos:
-                ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)
-                print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
+            try:
+                suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
+                if suspects_ddos:
+                    ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)  # dùng chung suffix qua helper
+                    print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
+            except Exception as e:
+                logger.error(f"DDoS detection failed: {e}")
+
+        # 4.2) Botnet/Cowrie (login thành công + có URL/file download)
+        if DETECT_BOTNET:
+            try:
+                cowrie_events = fetch_cowrie_events()
+                if not cowrie_events:
+                    print("[Botnet] Không có sự kiện Cowrie trong khoảng thời gian tra cứu.")
+                else:
+                    sessions = correlate_cowrie_sessions(cowrie_events)
+
+                    # Lọc nghi vấn: có IP nguồn (không nằm SAFE_IPS), có creds, và có URL/download
+                    suspicious = {}
+                    for sid, info in sessions.items():
+                        ip = info.get("src_ip")
+                        if not ip or ip in SAFE_IPS:
+                            continue
+                        if not (info.get("username") or info.get("password")):
+                            continue
+                        if not (info.get("urls") or info.get("downloads")):
+                            continue
+                        suspicious[sid] = info
+
+                    if suspicious:
+                        # Hàm này nên dùng cùng cơ chế suffix như Nmap/DDOS (qua _get_ts_suffix_from_daily)
+                        ev_bot = create_botnet_event_and_push(misp, suspicious)
+                        print(f"[+] Created Botnet event: {ev_bot} ({len(suspicious)} session)")
+                    else:
+                        print("[Botnet] Không có session login thành công kèm URL/download.")
+            except Exception as e:
+                logger.error(f"Botnet detection failed: {e}")
+
     except Exception as e:
         logger.error(f"Specialized detections failed: {e}")
 
