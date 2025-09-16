@@ -88,13 +88,13 @@ from misp_utils import (
     create_single_event_and_push_ips, create_daily_event_title, _get_ts_suffix_from_daily
 )
 
-from detectors.nmap import (
+from src.detectors.nmap import (
      detect_nmap_scanners, create_nmap_event_and_push
 )
-from detectors.ddos import (
+from src.detectors.ddos import (
      detect_ddos_sources, create_ddos_event_and_push
 )
-from detectors.botnet import (
+from src.detectors.botnet import (
      correlate_cowrie_sessions,
      create_botnet_event_and_push
 )
