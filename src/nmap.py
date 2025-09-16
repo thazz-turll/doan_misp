@@ -12,7 +12,7 @@ Kịch bản phát hiện Nmap scan:
 from logger import get_logger
 from config import SAFE_IPS, EVENT_TITLE_NMAP
 from ioc_utils import fmt_comment          # comment builder
-from misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment
+from misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment, _get_ts_suffix_from_daily
 from datetime import datetime, timezone
 import pandas as pd
 logger = get_logger("detect-nmap")
@@ -27,10 +27,6 @@ def detect_nmap_scanners(conns, threshold: int):
     grouped = df.groupby("ip")["port"].nunique()
     suspects = [ip for ip, cnt in grouped.items() if cnt >= threshold]
     return [ip for ip in suspects if ip not in SAFE_IPS]
-
-# Lấy hậu tố thời gian (ngày) cho event.
-def _get_ts_suffix_from_daily() -> str:
-    return create_daily_event_title().split(" - ", 1)[-1]
 
 # Tạo event MISP cho Nmap scan và đẩy IP nguồn.
 def create_nmap_event_and_push(misp, ip_list):
