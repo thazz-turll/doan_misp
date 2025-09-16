@@ -80,19 +80,21 @@ from es_utils import (
 )
 
 
-# ========================
-# 2. Helpers chung
-# ========================
+import misp_utils as MU  # để override _get_ts_suffix_from_daily
+from misp_utils import (
+    with_retry, add_attr_safe, tag_event,
+    create_event, get_event_id, push_iocs_to_misp,
+    create_single_event_and_push_ips, create_daily_event_title
+)
 
- # Tạo Elasticsearch client với cấu hình từ ENV.
-def es_client():
-    return Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
+ts_suffix = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
 
-# Sinh range query theo @timestamp cho số giờ lookback.
-def time_range_clause(hours: int):
-    now = datetime.now(timezone.utc)
-    start = (now - relativedelta(hours=hours)).isoformat()
-    return {"range": {"@timestamp": {"gte": start}}}
+def _fixed_suffix() -> str:
+    return ts_suffix
+
+MU._get_ts_suffix_from_daily = _fixed_suffix
+
+
 
 # Lấy timestamp local để chèn vào comment MISP.
 def _fmt_local_ts_for_comment() -> str:
@@ -124,214 +126,22 @@ def _is_retryable_exc(e):
     return False
 
 # Chạy hàm với retry + backoff khi gặp lỗi tạm thời.
-def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, who="op"):
-    """Chạy func() với exponential backoff/retry cho lỗi tạm thời."""
-    attempt = 0
-    while True:
-        try:
-            return func()
-        except Exception as e:
-            attempt += 1
-            if not _is_retryable_exc(e) or attempt >= max_attempts:
-                logger.error(f"[{who}] FAILED after {attempt} attempts: {e}")
-                raise
-            delay = min(cap, base * (2 ** (attempt - 1))) + random.uniform(0, base)
-            logger.warning(f"[{who}] attempt {attempt} failed: {e} → retry in {delay:.2f}s")
-            time.sleep(delay)
+
 
 # Thêm attribute vào event MISP với retry an toàn.
-def add_attr_safe(misp: PyMISP, event_id: str, a_type: str, value: str,
-                  category: str = "Other", comment: str = "", to_ids: bool = False):
-    attr = {"type": a_type, "category": category, "value": value,
-            "to_ids": to_ids, "comment": comment}
-    return with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True),
-                      who="misp.add_attribute_botnet")
+
                       
 # Gắn danh sách tag vào event MISP.
-def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
-    """Gắn danh sách tag vào event (best-effort, có retry)."""
-    try:
-        ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_tag")
-        event_uuid = getattr(ev, "uuid", None)
-        if not event_uuid:
-            logger.warning(f"Không lấy được UUID cho event {event_id}, thử gắn theo ID.")
-            event_uuid = event_id  # fallback
-        for t in tags:
-            try:
-                with_retry(lambda: misp.tag(event_uuid, t), who="misp.tag_event")
-                logger.info(f"TAG event {event_uuid} with '{t}'")
-            except Exception as e:
-                logger.error(f"Gắn tag '{t}' vào event {event_uuid} thất bại: {e}")
-    except Exception as e:
-        logger.error(f"get_event({event_id}) để gắn tag thất bại: {e}")
 
 
 # ========================
 # 3. Fetch dữ liệu từ ES
 # ========================
 
-# Truy vấn ES và trích xuất IoC (IP, URL, domain, hash, credential).
-def fetch_iocs_from_es():
-    """Truy vấn ES, trích IoC (dedupe), trả về DataFrame(các IoC)."""
-    # ES client
-    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
-    esq = es.options(request_timeout=60)
-    now = datetime.now(timezone.utc)
-    start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
-    base_query = {
-        "_source": ES_SOURCE_FIELDS,
-        "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
-        "query": {"range": {"@timestamp": {"gte": start}}}
-    }
-    page_size = 3000
-    search_after = None
-    # Dedupe sớm theo (ioc_type, value)
-    seen = set()    # {(type, value)}
-    rows = []       # list[dict]
-    def add_row(ts, src_ip, typ, val):
-        """Thêm 1 IoC vào rows nếu chưa thấy trước đó."""
-        if not typ or not val:
-            return
-        key = (typ, val)
-        if key in seen:
-            return
-        seen.add(key)
-        rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": typ, "value": val})
-    while True:
-        body = dict(base_query)
-        body["size"] = page_size
-        if search_after:
-            body["search_after"] = search_after
-        body["track_total_hits"] = False
-        resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search")
-        hits = resp.get("hits", {}).get("hits", [])
-        if not hits:
-            break
-        for hit in hits:
-            s = hit.get("_source", {}) or {}
-            ts = first(s.get("@timestamp"))
-            # 1) IP nguồn
-            src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
-            if src_ip:
-                src_ip = str(src_ip)
-                add_row(ts, src_ip, "ip", src_ip)
-            # 2) Credentials (nếu có)
-            u = first(s.get("user.name")) or first(s.get("username"))
-            p = first(s.get("password"))
-            if u or p:
-                cred = f"{u or ''}:{p or ''}"
-                add_row(ts, src_ip, "credential", cred)
-            # 3) Hash từ field chuyên dụng
-            for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
-                for val in many(s.get(fld)):
-                    if not val:
-                        continue
-                    v = str(val).strip()
-                    if classify_hash(v):
-                        add_row(ts, src_ip, "hash", v)
-            # 3b) Hash trong text (hashes, message)
-            text_buf = []
-            for fld in ["hashes", "message"]:
-                for val in many(s.get(fld)):
-                    if val:
-                        text_buf.append(str(val))
-            if text_buf:
-                merged = "\n".join(text_buf)
-                labeled_found = False
-                for _, h in LABELED_HASH_RE.findall(merged):
-                    if classify_hash(h):
-                        add_row(ts, src_ip, "hash", h)
-                        labeled_found = True
-                if not labeled_found:
-                    for h in BARE_HASH_RE.findall(merged):
-                        if classify_hash(h):
-                            add_row(ts, src_ip, "hash", h)
-            # 4) URL từ field có cấu trúc
-            for fld in ["url.full", "url.original", "http.url", "url"]:
-                for val in many(s.get(fld)):
-                    if not val:
-                        continue
-                    v = normalize_url(str(val))
-                    if v and v.lower().startswith(("http://", "https://")):
-                        add_row(ts, src_ip, "url", v)
-            # 4b) Nếu chỉ có host → ghép http://host thành URL tối thiểu
-            host = first(s.get("url.domain")) or first(s.get("http.hostname")) \
-                   or first(s.get("hostname"))   or first(s.get("domain"))
-            if host:
-                h = normalize_domain(str(host))
-                if h and "." in h and " " not in h:
-                    add_row(ts, src_ip, "url", f"http://{h}")
-            # 4c) URL trong message (regex http/https)
-            for val in many(s.get("message")):
-                if not val:
-                    continue
-                for m in URL_RE.findall(str(val)):
-                    v = normalize_url(m)
-                    if v and v.lower().startswith(("http://", "https://")):
-                        add_row(ts, src_ip, "url", v)
-            # 5) HOSTNAME từ field có cấu trúc
-            for fld in ["http.hostname", "hostname"]:
-                for val in many(s.get(fld)):
-                    if not val:
-                        continue
-                    h = normalize_domain(str(val))
-                    if "." in h and " " not in h:
-                        add_row(ts, src_ip, "hostname", h)
-            # 6) DOMAIN từ field có cấu trúc
-            for fld in ["domain", "url.domain"]:
-                for val in many(s.get(fld)):
-                    if not val:
-                        continue
-                    d = normalize_domain(str(val))
-                    if "." in d and " " not in d:
-                        add_row(ts, src_ip, "domain", d)
-            # 7) Hostname/Domain phát hiện trong message (regex)
-            for val in many(s.get("message")):
-                if not val:
-                    continue
-                for d in DOMAIN_RE.findall(str(val)):
-                    d2 = normalize_domain(d)
-                    if d2 and "." in d2 and " " not in d2:
-                        # Heuristic: >=3 label → hostname, =2 label → domain
-                        if d2.count(".") >= 2:
-                            add_row(ts, src_ip, "hostname", d2)
-                        else:
-                            add_row(ts, src_ip, "domain", d2)
-        search_after = hits[-1]["sort"]
-        if len(hits) < page_size:
-            break
-    if not rows:
-        return pd.DataFrame()
-    return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
+
 
 # Lấy (src_ip, dest_port) từ ES để phục vụ Nmap/DDoS.
-def fetch_conn_tuples_from_es():
-    """
-    Lấy (src_ip, dst_port) trong khoảng HOURS_LOOKBACK để phục vụ heuristics Nmap/DDoS.
-    """
-    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
-    esq = es.options(request_timeout=60)
 
-    now = datetime.now(timezone.utc)
-    start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
-
-    body = {
-        "_source": ["@timestamp", "source.ip", "src_ip", "destination.port", "dest_port"],
-        "query": {"range": {"@timestamp": {"gte": start}}},
-        "size": 5000,
-        "sort": [{"@timestamp": {"order": "desc"}}],
-        "track_total_hits": False
-    }
-    resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search_conn")
-
-    rows = []
-    for h in resp.get("hits", {}).get("hits", []):
-        s = h.get("_source", {}) or {}
-        ip = first(s.get("source.ip")) or first(s.get("src_ip"))
-        dp = first(s.get("destination.port")) or first(s.get("dest_port"))
-        if ip and dp:
-            rows.append((str(ip), str(dp)))
-    return rows
 
 # ========================
 # 4. Kịch bản Nmap & DDoS
@@ -390,39 +200,7 @@ def create_ddos_event_and_push(misp, ip_list):
 # ========================
 
 # Lấy log Cowrie từ ES (login, command, file download).
-def fetch_cowrie_events():
-    """Lấy log Cowrie trong khung thời gian HOURS_LOOKBACK."""
-    es = es_client()
-    body = {
-        "_source": [
-            "@timestamp","eventid","session",
-            "src_ip","source.ip",
-            "username","user.name","password",
-            "message","args",
-            "url","shasum",
-            "path","type"
-        ],
-        "query": {
-            "bool": {
-                "must": [ time_range_clause(HOURS_LOOKBACK) ],
-                "should": [
-                    {"terms": {"eventid.keyword": [
-                        "cowrie.login.success",
-                        "cowrie.command.input",
-                        "cowrie.session.file_download"
-                    ]}},
-                    {"term": {"type.keyword": "Cowrie"}},
-                    {"wildcard": {"path.keyword": "*cowrie*"}}
-                ],
-                "minimum_should_match": 1
-            }
-        },
-        "size": 10000,
-        "sort": [{"@timestamp": {"order": "asc"}}]
-    }
-    resp = es.search(index=ES_INDEX, body=body)
-    hits = resp.get("hits", {}).get("hits", [])
-    return [h.get("_source", {}) for h in hits]
+
 
 # Trích URL từ command input/args của Cowrie.
 def extract_urls_from_command(msg, args):
@@ -578,43 +356,13 @@ def create_botnet_event_and_push(misp, sessions):
 
 
 # Tạo event đơn lẻ và đẩy danh sách IP.
-def create_single_event_and_push_ips(misp: PyMISP, title: str, ip_list: list[str], comment: str = "") -> str:
-    """Tạo event mới với 'title' và add các ip-src; trả về event_id."""
-    ev = MISPEvent()
-    ev.info            = title
-    ev.distribution    = EVENT_DISTRIBUTION
-    ev.analysis        = EVENT_ANALYSIS
-    ev.threat_level_id = THREAT_LEVEL_ID
-    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
 
-    event_id = None
-    try:
-        event_id = res["Event"]["id"]
-    except Exception:
-        event_id = getattr(res, "id", None)
-
-    event_id = str(event_id)
-    for ip in ip_list:
-        attr = {
-            "type": "ip-src",
-            "category": "Network activity",
-            "value": ip,
-            "to_ids": True,
-            "comment": comment or "Detected by heuristic",
-        }
-        with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True), who="misp.add_attr_detection")
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {event_id}")
-    return event_id
 
  # Sinh tiêu đề event theo prefix + ngày.
-def create_daily_event_title():
-    """Tạo tiêu đề event theo prefix + EVENT_TITLE_FORMAT (theo giờ local)."""
-    ts = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
-    return f"{EVENT_TITLE_PREFIX} - {ts}"
+
 
 # Lấy hậu tố thời gian (ngày) cho event.
-def _get_ts_suffix_from_daily() -> str:
-    return create_daily_event_title().split(" - ", 1)[-1]
+
 
  # Tạo event mới trên MISP với tiêu đề cho trước.
 def _create_event_with_title(misp: PyMISP, title: str) -> str:
@@ -634,124 +382,13 @@ def _create_event_with_title(misp: PyMISP, title: str) -> str:
     return ev_id
 
 # Tạo event MISP chung, trả về event_id.
-def create_event(misp: PyMISP, title: str) -> str:
-    """Tạo MISP Event mới và trả về event_id."""
-    ev = MISPEvent()
-    ev.info            = title
-    ev.distribution    = EVENT_DISTRIBUTION
-    ev.analysis        = EVENT_ANALYSIS
-    ev.threat_level_id = THREAT_LEVEL_ID
 
-    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event")
-
-    # Lấy event_id đúng cách
-    event_id = None
-    try:
-        event_id = res["Event"]["id"]
-    except Exception:
-        event_id = getattr(res, "id", None) or getattr(getattr(res, "Event", None), "id", None)
-
-    if not event_id:
-        raise RuntimeError(f"Cannot create MISP event, unexpected response: {type(res)} {res}")
-
-    return str(event_id)
 
 
 # Lấy hoặc tạo event chính (theo DAILY hoặc APPEND mode).
-def get_event_id(misp: PyMISP, ts_suffix: str | None = None):
-    suffix = ts_suffix or datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
-    today_title = f"{EVENT_TITLE_PREFIX} - {suffix}"
 
-    if EVENT_MODE == "APPEND":
-        if not MISP_EVENT_ID:
-            raise ValueError("EVENT_MODE=APPEND nhưng thiếu MISP_EVENT_ID")
-        ev = with_retry(lambda: misp.get_event(MISP_EVENT_ID), who="misp.get_event")
-        if not ev or ("Event" not in ev and not getattr(ev, "id", None)):
-            raise ValueError(f"MISP_EVENT_ID={MISP_EVENT_ID} không tồn tại/không truy cập được")
-        return MISP_EVENT_ID
-
-    if EVENT_MODE == "DAILY":
-        try:
-            # ✅ Tìm theo tiêu đề Event (eventinfo), metadata nhanh hơn
-            # Cách 1: dùng search_index (nhanh)
-            idx = with_retry(
-                lambda: misp.search_index(eventinfo=today_title), 
-                who="misp.search_index_event"
-            )
-            # idx là list dict; lọc đúng tiêu đề
-            for it in idx or []:
-                if it.get('info') == today_title:
-                    return str(it.get('id'))
-
-            # Cách 2 (fallback): search controller='events' + eventinfo, pythonify=True
-            search_result = with_retry(
-                lambda: misp.search(controller='events', eventinfo=today_title, metadata=True, pythonify=True),
-                who="misp.search_event_by_eventinfo"
-            )
-            if search_result:
-                # Lọc đúng info (tránh match mơ hồ)
-                for ev in search_result:
-                    if getattr(ev, "info", "") == today_title:
-                        return str(ev.id)
-        except Exception as e:
-            logger.warning(f"Tìm event DAILY bị lỗi: {e}")
-
-        # Không tìm thấy → tạo mới
-        return create_event(misp, today_title)
-
-    raise ValueError(f"EVENT_MODE={EVENT_MODE} không hợp lệ")
 
  # Đẩy IoC từ DataFrame vào event MISP (check trùng, gắn tag).
-def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
-    """Đẩy các IoC trong DataFrame vào MISP Event (check trùng, tag IP private nếu cấu hình)."""
-    existing = set()
-    try:
-        ev = with_retry(lambda: misp.get_event(event_id, pythonify=True), who="misp.get_event_for_attrs")
-        for a in getattr(ev, "attributes", []) or []:
-            existing.add((a.type, a.value))
-    except Exception as e:
-        logger.warning(f"get_event attributes failed: {e}")
-
-    added, skipped = 0, 0
-    for _, row in df.iterrows():
-        mapped = map_row_to_misp(row)
-        if not mapped:
-            skipped += 1
-            continue
-        misp_type, category, to_ids, value, comment, is_private = mapped
-        key = (misp_type, value)
-        if key in existing:
-            skipped += 1
-            continue
-
-        attr = {"type": misp_type, "category": category, "value": value, "to_ids": to_ids, "comment": comment}
-        
-        try:
-            def _add():
-                return misp.add_attribute(event_id, attr, pythonify=True)
-
-            aobj = with_retry(_add, who="misp.add_attribute")
-            added += 1
-            existing.add(key)
-            logger.info(f"ADD {misp_type} value={value} to_ids={to_ids} comment='{comment}'")
-            if TAG_PRIVATE_IP_ATTR and is_private and getattr(aobj, "uuid", None):
-                try:
-                    with_retry(lambda: misp.tag(aobj.uuid, PRIVATE_IP_TAG), who="misp.tag_attr")
-                    logger.info(f"TAG attribute {aobj.uuid} with {PRIVATE_IP_TAG}")
-                except Exception:
-                    pass
-                    
-        except Exception as e:
-               msg = str(e).lower()
-               if "already exists" in msg or "409" in msg:
-                  skipped += 1
-                  existing.add(key)
-                  logger.info(f"SKIP duplicate (server said exists): {key}")
-               else:
-                   skipped += 1
-                   logger.error(f"add_attribute failed: type={misp_type} value={value} err={e}")
-
-    return added, skipped
 
 # ===== main =====
 
