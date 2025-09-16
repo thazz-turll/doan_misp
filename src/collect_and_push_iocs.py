@@ -602,6 +602,25 @@ def correlate_cowrie_sessions(events):
     return sessions
 
 
+
+def ip_to_first_session(sessions: dict[str, dict]) -> dict[str, str]:
+    """
+    Chọn session sớm nhất (ts_first nhỏ nhất) cho mỗi src_ip.
+    """
+    by_ip = {}
+    for sid, info in sessions.items():
+        ip = info.get("src_ip")
+        ts = info.get("ts_first") or ""
+        if not ip:
+            continue
+        best = by_ip.get(ip)
+        if best is None or (ts and ts < best[0]):
+            by_ip[ip] = (ts, sid)
+    # trả về map ip -> sid
+    return {ip: t_sid[1] for ip, t_sid in by_ip.items()}
+
+
+
 # ===== MISP mapping / push =====
 
 def map_row_to_misp(row):
@@ -708,26 +727,28 @@ def _create_event_with_title(misp: PyMISP, title: str) -> str:
         tag_event(misp, ev_id, MISP_TAGS)
     return ev_id
 
-def create_nmap_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
+def create_nmap_event_and_push(misp, ip_list, ip2sess: dict[str, str] | None = None):
     title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
-        comment = fmt_comment(ip, f"nmap-{ip}", ts_local)
-        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", comment, True)
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
+        if ip in SAFE_IPS:
+            continue
+        sid = ip2sess.get(ip) if ip2sess else None
+        cmt = fmt_comment(ip, sid, ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
     return ev_id
 
-
-
-def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
+def create_ddos_event_and_push(misp, ip_list, ip2sess: dict[str, str] | None = None):
     title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
-        comment = fmt_comment(ip, f"ddos-{ip}", ts_local)
-        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", comment, True)
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
+        if ip in SAFE_IPS:
+            continue
+        sid = ip2sess.get(ip) if ip2sess else None
+        cmt = fmt_comment(ip, sid, ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
     return ev_id
 
 
@@ -959,7 +980,7 @@ def main():
     global _get_ts_suffix_from_daily
     _get_ts_suffix_from_daily = _fixed_suffix
 
-    # 1) Lấy IoC từ ES
+    # 1) Lấy IoC từ ES (dùng để push vào event chính)
     df = fetch_iocs_from_es()
     total = 0 if df is None or df.empty else len(df)
     logger.info(f"IoC fetched: {total}")
@@ -991,20 +1012,37 @@ def main():
         # 4.1) Nmap & DDoS dựa trên kết nối (nếu bật)
         conns = fetch_conn_tuples_from_es() if (DETECT_NMAP or DETECT_DDOS) else None
 
+        # Trước khi tạo các event Nmap/DDoS, cố gắng lấy sessions từ Cowrie để map IP->session
+        sessions = {}
+        ip2sess = {}
+        if DETECT_BOTNET:
+            try:
+                cowrie_events = fetch_cowrie_events()
+                if cowrie_events:
+                    sessions = correlate_cowrie_sessions(cowrie_events)
+                    ip2sess = ip_to_first_session(sessions)
+                else:
+                    logger.info("[Botnet] Không lấy được cowrie events (rỗng).")
+            except Exception as e:
+                logger.warning(f"[Botnet] Lấy sessions từ Cowrie thất bại: {e}")
+
+        # NMAP
         if DETECT_NMAP and conns:
             try:
                 suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
                 if suspects_nmap:
-                    ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)  # dùng chung suffix qua helper
+                    # truyền ip2sess để comment có session nếu có
+                    ev_nmap = create_nmap_event_and_push(misp, suspects_nmap, ip2sess)
                     print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
             except Exception as e:
                 logger.error(f"Nmap detection failed: {e}")
 
+        # DDOS
         if DETECT_DDOS and conns:
             try:
                 suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
                 if suspects_ddos:
-                    ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)  # dùng chung suffix qua helper
+                    ev_ddos = create_ddos_event_and_push(misp, suspects_ddos, ip2sess)
                     print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
             except Exception as e:
                 logger.error(f"DDoS detection failed: {e}")
@@ -1012,37 +1050,33 @@ def main():
         # 4.2) Botnet/Cowrie (login thành công + có URL/file download)
         if DETECT_BOTNET:
             try:
-                cowrie_events = fetch_cowrie_events()
-                if not cowrie_events:
-                    print("[Botnet] Không có sự kiện Cowrie trong khoảng thời gian tra cứu.")
+                # nếu chưa có sessions từ trên, lấy bây giờ
+                if not sessions:
+                    cowrie_events = fetch_cowrie_events()
+                    sessions = correlate_cowrie_sessions(cowrie_events) if cowrie_events else {}
+
+                # Lọc nghi vấn: có IP nguồn (không nằm SAFE_IPS), có creds, và có URL/download
+                suspicious = {}
+                for sid, info in sessions.items():
+                    ip = info.get("src_ip")
+                    if not ip or ip in SAFE_IPS:
+                        continue
+                    if not (info.get("username") or info.get("password")):
+                        continue
+                    if not (info.get("urls") or info.get("downloads")):
+                        continue
+                    suspicious[sid] = info
+
+                if suspicious:
+                    ev_bot = create_botnet_event_and_push(misp, suspicious)
+                    print(f"[+] Created Botnet event: {ev_bot} ({len(suspicious)} session)")
                 else:
-                    sessions = correlate_cowrie_sessions(cowrie_events)
-
-                    # Lọc nghi vấn: có IP nguồn (không nằm SAFE_IPS), có creds, và có URL/download
-                    suspicious = {}
-                    for sid, info in sessions.items():
-                        ip = info.get("src_ip")
-                        if not ip or ip in SAFE_IPS:
-                            continue
-                        if not (info.get("username") or info.get("password")):
-                            continue
-                        if not (info.get("urls") or info.get("downloads")):
-                            continue
-                        suspicious[sid] = info
-
-                    if suspicious:
-                        # Hàm này nên dùng cùng cơ chế suffix như Nmap/DDOS (qua _get_ts_suffix_from_daily)
-                        ev_bot = create_botnet_event_and_push(misp, suspicious)
-                        print(f"[+] Created Botnet event: {ev_bot} ({len(suspicious)} session)")
-                    else:
-                        print("[Botnet] Không có session login thành công kèm URL/download.")
+                    print("[Botnet] Không có session login thành công kèm URL/download.")
             except Exception as e:
                 logger.error(f"Botnet detection failed: {e}")
 
     except Exception as e:
         logger.error(f"Specialized detections failed: {e}")
-
-
 
 
 if __name__ == "__main__":
