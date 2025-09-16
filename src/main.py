@@ -118,14 +118,7 @@ def main():
     logger.info(f"IoC fetched: {total}")
     if df is None or df.empty:
         print("[!] Không có IoC nào trong khoảng thời gian yêu cầu.")
-    else:
-        # In vài dòng đầu để kiểm tra ioc_type/value có đúng không
-        try:
-            print("[DEBUG] IoC sample:")
-            print(df.head(10).to_string(index=False))
-            print("[DEBUG] ioc_type counts:\n", df["ioc_type"].value_counts(dropna=False).to_string())
-        except Exception:
-            pass
+    
 
     # 2) Kết nối MISP (dùng chung cho push IoC và các detection)
     misp = PyMISP(MISP_URL, MISP_KEY, VERIFY_SSL)
