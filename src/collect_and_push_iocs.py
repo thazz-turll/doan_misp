@@ -625,12 +625,7 @@ def map_row_to_misp(row):
             pass
 
     src = str(row.get("src_ip", "")).strip()
-    comment_parts = []
-    if src:
-        comment_parts.append(f"src_ip={src}")
-    if ts_local_str:
-        comment_parts.append(f"ts={ts_local_str}")
-    comment = "; ".join(comment_parts)
+    comment = fmt_comment(src, f"ioc-{src}", ts_local_str)
 
     # Hash
     if ioc_type == "hash":
@@ -718,11 +713,11 @@ def create_nmap_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
-        comment = f"src_ip={ip}; ts={ts_local}; detection=NmapScan"
-        attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
-        with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
+        comment = fmt_comment(ip, f"nmap-{ip}", ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", comment, True)
         logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
+
 
 
 def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
@@ -730,12 +725,10 @@ def create_ddos_event_and_push(misp: PyMISP, ip_list: list[str]) -> str:
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
-        comment = f"src_ip={ip}; ts={ts_local}; detection=DDOSFlood"
-        attr = {"type":"ip-src","category":"Network activity","value":ip,"to_ids":True,"comment":comment}
-        with_retry(lambda: misp.add_attribute(ev_id, attr, pythonify=True), who="misp.add_attr_detection")
+        comment = fmt_comment(ip, f"ddos-{ip}", ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", comment, True)
         logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {ev_id} (comment='{comment}')")
     return ev_id
-
 
 
 def fmt_comment(src_ip: str, session_id: str | None, ts_first: str | None) -> str:
