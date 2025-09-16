@@ -1,6 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# ===============================================================
+#  T-Pot → Elasticsearch → MISP: Thu thập IoC + phát hiện Nmap/DDoS/Cowrie
+#  Phiên bản: "reorganized-with-notes"
+#  Lưu ý quan trọng:
+#   - Chỉ sắp xếp lại vị trí các phần/hàm và bổ sung chú thích.
+#   - Không thay đổi logic hay nội dung lệnh trong thân hàm.
+#   - Các comment (# ...) được thêm để giải thích vai trò từng phần.
+# ===============================================================
+
+# -----------------------------
+# 1) IMPORTS & THƯ VIỆN
+# -----------------------------
 import os
 import re
 import sys
@@ -21,8 +33,10 @@ from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ===== .env =====
-# Load biến môi trường (nếu có .env)
+# -----------------------------
+# 2) NẠP ENV & CẤU HÌNH CHUNG
+# -----------------------------
+# .env (tùy chọn)
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -33,9 +47,11 @@ except Exception:
 # Đọc cấu hình chính từ ENV
 ES_URL = os.getenv("ES_URL")                # bắt buộc
 MISP_URL = os.getenv("MISP_URL")            # bắt buộc
-MISP_KEY = os.getenv("MISP_KEY")            # bắt buộc
+MISP_KEY = os.getenv("MISP_KEY")    
+# bắt buộc
 EVENT_TITLE_PREFIX = os.getenv("EVENT_TITLE_PREFIX", "T-Pot IoC Collection")
 EVENT_TITLE_FORMAT = os.getenv("EVENT_TITLE_FORMAT", "%Y-%m-%d")
+
 missing = []
 if not ES_URL:   missing.append("ES_URL")
 if not MISP_URL: missing.append("MISP_URL")
@@ -66,45 +82,44 @@ LOG_FILE       = os.getenv("LOG_FILE", "ioc_es_to_misp.log")
 LOG_MAX_BYTES  = int(os.getenv("LOG_MAX_BYTES", "1048576"))  # 1MB
 LOG_BACKUPS    = int(os.getenv("LOG_BACKUPS", "3"))
 
-# ===== Logger =====
-# Khởi tạo logger xoay vòng file
+# -----------------------------
+# 3) LOGGER XOAY VÒNG
+# -----------------------------
 logger = logging.getLogger("ioc-es-misp-v3")
 logger.setLevel(logging.INFO)
 handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(handler)
 
-# ===== Regex/hash/url =====
-# Regex nhận diện hash/URL/domain trong log
+# -----------------------------
+# 4) REGEX & HẰNG SỐ PHỤ TRỢ
+# -----------------------------
+# Regex phân loại hash
 MD5_RE    = re.compile(r"^[a-fA-F0-9]{32}$")
 SHA1_RE   = re.compile(r"^[a-fA-F0-9]{40}$")
 SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
 SHA512_RE = re.compile(r"^[a-fA-F0-9]{128}$")
 
-
-# ==== Regex & constants (THÊM cho Cowrie) ====
+# Regex Cowrie & URL
 URL_RGX         = re.compile(r"(?P<url>(?:https?|ftp)://[^\s'\"<>]+)", re.IGNORECASE)
 LOGIN_SUCC_RGX  = re.compile(r'login attempt \[([^/\]]+)/([^\]]+)\]\s+succeeded', re.IGNORECASE)
 IP_HOST_RGX     = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
 
-
-# có nhãn: md5: <...>, sha1=..., sha256:..., sha512=...
+# Regex tìm hash trong chuỗi tự do
 LABELED_HASH_RE = re.compile(
     r"(?i)\b(md5|sha1|sha256|sha512)\s*[:=]\s*([a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64}|[a-f0-9]{128})\b"
 )
-# không nhãn: chuỗi hex 32|40|64|128 ký tự
 BARE_HASH_RE = re.compile(
     r"\b([A-Fa-f0-9]{32}|[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}|[A-Fa-f0-9]{128})\b"
 )
-URL_RE          = re.compile(r"\bhttps?://[^\s\"']{4,}\b", re.IGNORECASE)
+URL_RE = re.compile(r"\bhttps?://[^\s\"']{4,}\b", re.IGNORECASE)
 
 DOMAIN_RE = re.compile(
     r"\b(?=.{1,253}\b)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}\b",
     re.IGNORECASE
 )
 
-
-# Map base (non-hash)
+# Map base (non-hash) → MISP attribute
 MAPPING_BASE = {
     "ip":        ("ip-src", "Network activity", True),   # to_ids có thể bị override nếu là private
     "domain":    ("domain", "Network activity", True),
@@ -113,45 +128,65 @@ MAPPING_BASE = {
     "credential":("text",   "Other",            False),  # không đẩy sang IDS
 }
 
+# Retry/backoff cấu hình
 RETRY_BASE = float(os.getenv("RETRY_BASE", "0.5"))   # giây
 RETRY_CAP  = float(os.getenv("RETRY_CAP", "8"))      # giây
 RETRY_MAX  = int(os.getenv("RETRY_MAX", "5"))        # số lần thử
 
-# ===== Helpers =====
-# ==== BOTNET / COWRIE DETECTION (ENV) ====
-DETECT_BOTNET      = os.getenv("DETECT_BOTNET", "true").lower() == "true"
-EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
-
-# reuse HOURS_LOOKBACK đã có; nếu code chính đặt khác, ưu tiên cái hiện có
+# -----------------------------
+# 5) CỜ PHÁT HIỆN (BOTNET / NMAP / DDoS)
+# -----------------------------
 ALLOW_SAMPLE_FETCH = os.getenv("ALLOW_SAMPLE_FETCH", "false").lower() == "true"
 SAMPLE_MAX_BYTES   = int(os.getenv("SAMPLE_MAX_BYTES", "5242880"))
 
-
 DETECT_NMAP      = os.getenv("DETECT_NMAP", "false").lower() == "true"
 DETECT_DDOS      = os.getenv("DETECT_DDOS", "false").lower() == "true"
+DETECT_BOTNET      = os.getenv("DETECT_BOTNET", "true").lower() == "true"
+
 NMAP_THRESHOLD   = int(os.getenv("NMAP_THRESHOLD", "10"))
 DDOS_THRESHOLD   = int(os.getenv("DDOS_THRESHOLD", "100"))
+
 EVENT_TITLE_NMAP = os.getenv("EVENT_TITLE_NMAP", "Nmap Scan Detected")
 EVENT_TITLE_DDOS = os.getenv("EVENT_TITLE_DDOS", "Potential DDoS Activity (SYN Flood)")
+EVENT_TITLE_BOTNET = os.getenv("EVENT_TITLE_BOTNET", "Botnet Infection Attempt (Cowrie)")
+
 SAFE_IPS         = [ip.strip() for ip in os.getenv("SAFE_IPS", "").split(",") if ip.strip()]
 
+#Elasticsearch IoC Fetch
+ES_SOURCE_FIELDS = [
+    "@timestamp",
+    "source.ip","src_ip",
+    "user.name","username","password",
+    "md5","sha1","sha256","sha512","hash","hashes","message",
+
+    # URL & domain (bao phủ phổ biến)
+    "url","http.url","url.full","url.original","url.domain",
+    "http.hostname","hostname","domain",
+]
+
+# ========================
+# 2. Helpers chung
+# ========================
+
+ # Tạo Elasticsearch client với cấu hình từ ENV.
 def es_client():
     return Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
 
+# Sinh range query theo @timestamp cho số giờ lookback.
 def time_range_clause(hours: int):
     now = datetime.now(timezone.utc)
     start = (now - relativedelta(hours=hours)).isoformat()
     return {"range": {"@timestamp": {"gte": start}}}
 
+# Lấy timestamp local để chèn vào comment MISP.
 def _fmt_local_ts_for_comment() -> str:
     """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
     d = datetime.now().astimezone()
     tz_raw = d.strftime("%z")  # ví dụ +0700
     tz_short = tz_raw[:3] if tz_raw else ""
     return d.strftime("%Y-%m-%d %H:%M:%S") + (f" {tz_short}" if tz_short else "")
-
-
-
+    
+# Kiểm tra exception có nên retry không.
 def _is_retryable_exc(e):
     """Xác định lỗi tạm thời (nên retry)."""
     # ES errors
@@ -164,7 +199,6 @@ def _is_retryable_exc(e):
         if status in (429, 500, 502, 503, 504) or status is None:
             return True
         return False
-
     # Requests / PyMISP
     if isinstance(e, RequestException):
         # đa phần lỗi mạng tạm thời trong nhóm này → retry
@@ -173,7 +207,7 @@ def _is_retryable_exc(e):
     # Các Exception khác: cho retry một cách thận trọng
     return False
 
-
+# Chạy hàm với retry + backoff khi gặp lỗi tạm thời.
 def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, who="op"):
     """Chạy func() với exponential backoff/retry cho lỗi tạm thời."""
     attempt = 0
@@ -189,21 +223,21 @@ def with_retry(func, *, max_attempts=RETRY_MAX, base=RETRY_BASE, cap=RETRY_CAP, 
             logger.warning(f"[{who}] attempt {attempt} failed: {e} → retry in {delay:.2f}s")
             time.sleep(delay)
 
-
+# Trả về phần tử đầu nếu là list, ngược lại trả v.
 def first(v):
     """Lấy phần tử đầu nếu v là list, ngược lại trả về v."""
     if isinstance(v, list) and v:
         return v[0]
     return v
 
-
+# Bọc giá trị đơn thành list.
 def many(v):
     """Đảm bảo giá trị là list (bọc đơn thành list)."""
     if isinstance(v, list):
         return v
     return [v] if v is not None else []
 
-
+# Phân loại hash theo độ dài (md5/sha1/sha256/sha512).
 def classify_hash(h: str):
     """Phân loại hash theo độ dài: md5/sha1/sha256/sha512, không khớp → None."""
     if not isinstance(h, str):
@@ -215,7 +249,7 @@ def classify_hash(h: str):
     if SHA512_RE.fullmatch(v): return "sha512"
     return None
 
-
+# Kiểm tra IP có thuộc nhóm private/non-routable không.
 def is_non_routable_ip(ip_str: str) -> bool:
     """Kiểm tra IP có phải non-routable/private/loopback..."""
     try:
@@ -232,14 +266,48 @@ def is_non_routable_ip(ip_str: str) -> bool:
         or getattr(ip_obj, "is_site_local", False)
         or getattr(ip_obj, "is_global", None) is False
     )
-
-
+    
+ # Chuẩn hóa domain/hostname (lowercase, bỏ dấu chấm cuối).
 def normalize_domain(d: str) -> str:
     """Chuẩn hóa domain/hostname (lower, bỏ dấu chấm cuối)."""
     d = str(d or "").strip().lower()
     return d[:-1] if d.endswith(".") else d
+    
+# Chuẩn hóa URL (lowercase netloc, giữ nguyên phần còn lại).
+def normalize_url(u: str) -> str:
+    """Chuẩn hóa URL (lower netloc, giữ nguyên scheme/path/query)."""
+    u = str(u or "").strip()
+    try:
+        p = urlparse(u)
+        netloc = p.netloc.lower()
+        return f"{p.scheme}://{netloc}{p.path or ''}{('?' + p.query) if p.query else ''}"
+    except Exception:
+        return u
 
+# Sinh comment mô tả IoC (src_ip, session, timestamp).
+def fmt_comment(src_ip: str, session_id: str | None, ts_first: str | None) -> str:
+    parts = []
+    if src_ip: parts.append(f"src_ip={src_ip}")
+    if session_id: parts.append(f"session={session_id}")
+    if ts_first:
+        try:
+            dt = parser.isoparse(ts_first)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parts.append("ts=" + dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"))
+        except Exception:
+            parts.append(f"ts={ts_first}")
+    return "; ".join(parts)
 
+# Thêm attribute vào event MISP với retry an toàn.
+def add_attr_safe(misp: PyMISP, event_id: str, a_type: str, value: str,
+                  category: str = "Other", comment: str = "", to_ids: bool = False):
+    attr = {"type": a_type, "category": category, "value": value,
+            "to_ids": to_ids, "comment": comment}
+    return with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True),
+                      who="misp.add_attribute_botnet")
+                      
+# Gắn danh sách tag vào event MISP.
 def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
     """Gắn danh sách tag vào event (best-effort, có retry)."""
     try:
@@ -258,53 +326,28 @@ def tag_event(misp: PyMISP, event_id: str, tags: list[str]):
         logger.error(f"get_event({event_id}) để gắn tag thất bại: {e}")
 
 
+# ========================
+# 3. Fetch dữ liệu từ ES
+# ========================
 
-def normalize_url(u: str) -> str:
-    """Chuẩn hóa URL (lower netloc, giữ nguyên scheme/path/query)."""
-    u = str(u or "").strip()
-    try:
-        p = urlparse(u)
-        netloc = p.netloc.lower()
-        return f"{p.scheme}://{netloc}{p.path or ''}{('?' + p.query) if p.query else ''}"
-    except Exception:
-        return u
-
-# ===== ES fetch (ip/domain/url/hash/credential) =====
-# Xây dựng danh sách field cần lấy từ ES
-ES_SOURCE_FIELDS = [
-    "@timestamp",
-    "source.ip","src_ip",
-    "user.name","username","password",
-    "md5","sha1","sha256","sha512","hash","hashes","message",
-
-    # URL & domain (bao phủ phổ biến)
-    "url","http.url","url.full","url.original","url.domain",
-    "http.hostname","hostname","domain",
-]
-
-
+# Truy vấn ES và trích xuất IoC (IP, URL, domain, hash, credential).
 def fetch_iocs_from_es():
     """Truy vấn ES, trích IoC (dedupe), trả về DataFrame(các IoC)."""
     # ES client
     es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
     esq = es.options(request_timeout=60)
-
     now = datetime.now(timezone.utc)
     start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
-
     base_query = {
         "_source": ES_SOURCE_FIELDS,
         "sort": [{"@timestamp": {"order": "desc", "unmapped_type": "date"}}],
         "query": {"range": {"@timestamp": {"gte": start}}}
     }
-
     page_size = 3000
     search_after = None
-
     # Dedupe sớm theo (ioc_type, value)
     seen = set()    # {(type, value)}
     rows = []       # list[dict]
-
     def add_row(ts, src_ip, typ, val):
         """Thêm 1 IoC vào rows nếu chưa thấy trước đó."""
         if not typ or not val:
@@ -314,36 +357,30 @@ def fetch_iocs_from_es():
             return
         seen.add(key)
         rows.append({"timestamp": ts, "src_ip": src_ip, "ioc_type": typ, "value": val})
-
     while True:
         body = dict(base_query)
         body["size"] = page_size
         if search_after:
             body["search_after"] = search_after
         body["track_total_hits"] = False
-
         resp = with_retry(lambda: esq.search(index=ES_INDEX, body=body), who="es.search")
         hits = resp.get("hits", {}).get("hits", [])
         if not hits:
             break
-
         for hit in hits:
             s = hit.get("_source", {}) or {}
             ts = first(s.get("@timestamp"))
-
             # 1) IP nguồn
             src_ip = first(s.get("source.ip")) or first(s.get("src_ip"))
             if src_ip:
                 src_ip = str(src_ip)
                 add_row(ts, src_ip, "ip", src_ip)
-
             # 2) Credentials (nếu có)
             u = first(s.get("user.name")) or first(s.get("username"))
             p = first(s.get("password"))
             if u or p:
                 cred = f"{u or ''}:{p or ''}"
                 add_row(ts, src_ip, "credential", cred)
-
             # 3) Hash từ field chuyên dụng
             for fld in ["md5", "sha1", "sha256", "sha512", "hash"]:
                 for val in many(s.get(fld)):
@@ -352,7 +389,6 @@ def fetch_iocs_from_es():
                     v = str(val).strip()
                     if classify_hash(v):
                         add_row(ts, src_ip, "hash", v)
-
             # 3b) Hash trong text (hashes, message)
             text_buf = []
             for fld in ["hashes", "message"]:
@@ -370,7 +406,6 @@ def fetch_iocs_from_es():
                     for h in BARE_HASH_RE.findall(merged):
                         if classify_hash(h):
                             add_row(ts, src_ip, "hash", h)
-
             # 4) URL từ field có cấu trúc
             for fld in ["url.full", "url.original", "http.url", "url"]:
                 for val in many(s.get(fld)):
@@ -379,7 +414,6 @@ def fetch_iocs_from_es():
                     v = normalize_url(str(val))
                     if v and v.lower().startswith(("http://", "https://")):
                         add_row(ts, src_ip, "url", v)
-
             # 4b) Nếu chỉ có host → ghép http://host thành URL tối thiểu
             host = first(s.get("url.domain")) or first(s.get("http.hostname")) \
                    or first(s.get("hostname"))   or first(s.get("domain"))
@@ -387,7 +421,6 @@ def fetch_iocs_from_es():
                 h = normalize_domain(str(host))
                 if h and "." in h and " " not in h:
                     add_row(ts, src_ip, "url", f"http://{h}")
-
             # 4c) URL trong message (regex http/https)
             for val in many(s.get("message")):
                 if not val:
@@ -396,7 +429,6 @@ def fetch_iocs_from_es():
                     v = normalize_url(m)
                     if v and v.lower().startswith(("http://", "https://")):
                         add_row(ts, src_ip, "url", v)
-
             # 5) HOSTNAME từ field có cấu trúc
             for fld in ["http.hostname", "hostname"]:
                 for val in many(s.get(fld)):
@@ -405,7 +437,6 @@ def fetch_iocs_from_es():
                     h = normalize_domain(str(val))
                     if "." in h and " " not in h:
                         add_row(ts, src_ip, "hostname", h)
-
             # 6) DOMAIN từ field có cấu trúc
             for fld in ["domain", "url.domain"]:
                 for val in many(s.get(fld)):
@@ -414,7 +445,6 @@ def fetch_iocs_from_es():
                     d = normalize_domain(str(val))
                     if "." in d and " " not in d:
                         add_row(ts, src_ip, "domain", d)
-
             # 7) Hostname/Domain phát hiện trong message (regex)
             for val in many(s.get("message")):
                 if not val:
@@ -427,17 +457,14 @@ def fetch_iocs_from_es():
                             add_row(ts, src_ip, "hostname", d2)
                         else:
                             add_row(ts, src_ip, "domain", d2)
-
         search_after = hits[-1]["sort"]
         if len(hits) < page_size:
             break
-
     if not rows:
         return pd.DataFrame()
     return pd.DataFrame(rows, columns=["timestamp", "src_ip", "ioc_type", "value"])
 
-
-
+# Lấy (src_ip, dest_port) từ ES để phục vụ Nmap/DDoS.
 def fetch_conn_tuples_from_es():
     """
     Lấy (src_ip, dst_port) trong khoảng HOURS_LOOKBACK để phục vụ heuristics Nmap/DDoS.
@@ -466,6 +493,11 @@ def fetch_conn_tuples_from_es():
             rows.append((str(ip), str(dp)))
     return rows
 
+# ========================
+# 4. Kịch bản Nmap & DDoS
+# ========================
+
+# Phát hiện IP quét nhiều cổng (nghi vấn Nmap).
 def detect_nmap_scanners(conns, threshold: int):
     """Trả về list IP có số cổng duy nhất >= threshold."""
     if not conns:
@@ -475,6 +507,7 @@ def detect_nmap_scanners(conns, threshold: int):
     suspects = [ip for ip, cnt in grouped.items() if cnt >= threshold]
     return [ip for ip in suspects if ip not in SAFE_IPS]
 
+# Phát hiện IP gửi nhiều kết nối (nghi vấn DDoS).
 def detect_ddos_sources(conns, threshold: int):
     """Trả về list IP có tổng số record >= threshold (dấu hiệu flood)."""
     if not conns:
@@ -484,9 +517,39 @@ def detect_ddos_sources(conns, threshold: int):
     suspects = [ip for ip, cnt in grouped.items() if cnt >= threshold]
     return [ip for ip in suspects if ip not in SAFE_IPS]
 
+# Tạo event MISP cho Nmap scan và đẩy IP nguồn.
+def create_nmap_event_and_push(misp, ip_list):
+    """Tạo event Nmap và push IP (không ghi session vào comment)."""
+    title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
+    ev_id = _create_event_with_title(misp, title)
+    ts_local = _fmt_local_ts_for_comment()
+    for ip in ip_list:
+        if ip in SAFE_IPS:
+            continue
+        # comment chỉ gồm src_ip + ts
+        cmt = fmt_comment(ip, None, ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
+    return ev_id
 
+# Tạo event MISP cho DDoS và đẩy IP nguồn.
+def create_ddos_event_and_push(misp, ip_list):
+    """Tạo event DDoS và push IP (không ghi session vào comment)."""
+    title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
+    ev_id = _create_event_with_title(misp, title)
+    ts_local = _fmt_local_ts_for_comment()
+    for ip in ip_list:
+        if ip in SAFE_IPS:
+            continue
+        # comment chỉ gồm src_ip + ts
+        cmt = fmt_comment(ip, None, ts_local)
+        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
+    return ev_id
 
+# ========================
+# 5. Kịch bản Botnet / Cowrie
+# ========================
 
+# Lấy log Cowrie từ ES (login, command, file download).
 def fetch_cowrie_events():
     """Lấy log Cowrie trong khung thời gian HOURS_LOOKBACK."""
     es = es_client()
@@ -521,7 +584,7 @@ def fetch_cowrie_events():
     hits = resp.get("hits", {}).get("hits", [])
     return [h.get("_source", {}) for h in hits]
 
-
+# Trích URL từ command input/args của Cowrie.
 def extract_urls_from_command(msg, args):
     texts = []
     if isinstance(msg, str): texts.append(msg)
@@ -533,14 +596,14 @@ def extract_urls_from_command(msg, args):
             urls.add(m.group("url").strip(";\"' )("))
     return list(urls)
 
-
+# Chuyển hostname thành IP.
 def resolve_ip(host):
     try:
         return socket.gethostbyname(host)
     except Exception:
         return None
 
-
+# Tải file (giới hạn dung lượng) và tính sha256.
 def safe_fetch_sha256(url):
     import requests, hashlib
     try:
@@ -561,7 +624,7 @@ def safe_fetch_sha256(url):
         logging.getLogger("botnet-detect").warning(f"safe_fetch_sha256 failed for {url}: {e}")
         return None
 
-
+# Gom log Cowrie theo session (src_ip, creds, URL, download).
 def correlate_cowrie_sessions(events):
     """Gom theo session, lấy src_ip/creds/URL/download/time đầu tiên."""
     sessions = {}
@@ -601,163 +664,7 @@ def correlate_cowrie_sessions(events):
         sessions[k]["urls"] = list(sessions[k]["urls"])
     return sessions
 
-# ===== MISP mapping / push =====
-
-def map_row_to_misp(row):
-    """Map 1 dòng IoC → tuple attribute cho MISP (type, category, to_ids, value, comment, is_private)."""
-    ioc_type = str(row.get("ioc_type", "")).strip().lower()
-    value    = str(row.get("value", "")).strip()
-    if not value:
-        return None
-
-    ts_str = str(row.get("timestamp", "")).strip()
-    ts_local_str = ts_str
-    if ts_str:
-        try:
-            dt = parser.isoparse(ts_str)
-            # Chỉ gán UTC nếu thiếu thông tin timezone
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            # Đổi sang giờ local của server
-            ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-        except Exception:
-            pass
-
-    src = str(row.get("src_ip", "")).strip()
-    # chỉ giữ src_ip + ts, bỏ session
-    comment = fmt_comment(src, None, ts_local_str)
-
-    # Hash
-    if ioc_type == "hash":
-        htype = classify_hash(value)
-        if not htype:
-            return None
-        return (htype, "Payload delivery", True, value, comment, False)
-
-    # IP
-    elif ioc_type == "ip":
-        is_private = is_non_routable_ip(value)
-        to_ids = not (DISABLE_IDS_FOR_PRIVATE and is_private)
-        if is_private:
-            comment = (comment + "; non-routable") if comment else "non-routable"
-        return ("ip-src", "Network activity", to_ids, value, comment, is_private)
-
-    # Domain / URL / Hostname
-    elif ioc_type in ("domain", "url", "hostname"):
-        misp_type, category, to_ids = MAPPING_BASE[ioc_type]
-        return (misp_type, category, to_ids, value, comment, False)
-
-    # Credential
-    elif ioc_type == "credential":
-        misp_type, category, to_ids = MAPPING_BASE[ioc_type]
-        return (misp_type, category, to_ids, value, comment, False)
-
-    else:
-        return None
-
-def create_single_event_and_push_ips(misp: PyMISP, title: str, ip_list: list[str], comment: str = "") -> str:
-    """Tạo event mới với 'title' và add các ip-src; trả về event_id."""
-    ev = MISPEvent()
-    ev.info            = title
-    ev.distribution    = EVENT_DISTRIBUTION
-    ev.analysis        = EVENT_ANALYSIS
-    ev.threat_level_id = THREAT_LEVEL_ID
-    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
-
-    event_id = None
-    try:
-        event_id = res["Event"]["id"]
-    except Exception:
-        event_id = getattr(res, "id", None)
-
-    event_id = str(event_id)
-    for ip in ip_list:
-        attr = {
-            "type": "ip-src",
-            "category": "Network activity",
-            "value": ip,
-            "to_ids": True,
-            "comment": comment or "Detected by heuristic",
-        }
-        with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True), who="misp.add_attr_detection")
-        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {event_id}")
-    return event_id
-
-
-def create_daily_event_title():
-    """Tạo tiêu đề event theo prefix + EVENT_TITLE_FORMAT (theo giờ local)."""
-    ts = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
-    return f"{EVENT_TITLE_PREFIX} - {ts}"
-
-def _get_ts_suffix_from_daily() -> str:
-    return create_daily_event_title().split(" - ", 1)[-1]
-
-def _create_event_with_title(misp: PyMISP, title: str) -> str:
-    ev = MISPEvent()
-    ev.info = title
-    ev.distribution = EVENT_DISTRIBUTION
-    ev.analysis = EVENT_ANALYSIS
-    ev.threat_level_id = THREAT_LEVEL_ID
-    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
-    try:
-        ev_id = res["Event"]["id"]
-    except Exception:
-        ev_id = getattr(res, "id", None)
-    ev_id = str(ev_id)
-    if MISP_TAGS:
-        tag_event(misp, ev_id, MISP_TAGS)
-    return ev_id
-
-def create_nmap_event_and_push(misp, ip_list):
-    """Tạo event Nmap và push IP (không ghi session vào comment)."""
-    title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
-    ev_id = _create_event_with_title(misp, title)
-    ts_local = _fmt_local_ts_for_comment()
-    for ip in ip_list:
-        if ip in SAFE_IPS:
-            continue
-        # comment chỉ gồm src_ip + ts
-        cmt = fmt_comment(ip, None, ts_local)
-        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
-    return ev_id
-
-
-def create_ddos_event_and_push(misp, ip_list):
-    """Tạo event DDoS và push IP (không ghi session vào comment)."""
-    title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
-    ev_id = _create_event_with_title(misp, title)
-    ts_local = _fmt_local_ts_for_comment()
-    for ip in ip_list:
-        if ip in SAFE_IPS:
-            continue
-        # comment chỉ gồm src_ip + ts
-        cmt = fmt_comment(ip, None, ts_local)
-        add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
-    return ev_id
-
-
-def fmt_comment(src_ip: str, session_id: str | None, ts_first: str | None) -> str:
-    parts = []
-    if src_ip: parts.append(f"src_ip={src_ip}")
-    if session_id: parts.append(f"session={session_id}")
-    if ts_first:
-        try:
-            dt = parser.isoparse(ts_first)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            parts.append("ts=" + dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z"))
-        except Exception:
-            parts.append(f"ts={ts_first}")
-    return "; ".join(parts)
-
-def add_attr_safe(misp: PyMISP, event_id: str, a_type: str, value: str,
-                  category: str = "Other", comment: str = "", to_ids: bool = False):
-    attr = {"type": a_type, "category": category, "value": value,
-            "to_ids": to_ids, "comment": comment}
-    return with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True),
-                      who="misp.add_attribute_botnet")
-
-
+# Tạo event MISP cho Botnet/Cowrie và đẩy IoC (IP, creds, URL, hash).
 def create_botnet_event_and_push(misp, sessions):
     title = f"{EVENT_TITLE_BOTNET} - {_get_ts_suffix_from_daily()}"
     ev = MISPEvent()
@@ -825,9 +732,120 @@ def create_botnet_event_and_push(misp, sessions):
 
     return event_id
 
+# ========================
+# 6. Mapping & Push IoC
+# ========================
 
+# Map 1 dòng IoC DataFrame sang attribute MISP.
+def map_row_to_misp(row):
+    """Map 1 dòng IoC → tuple attribute cho MISP (type, category, to_ids, value, comment, is_private)."""
+    ioc_type = str(row.get("ioc_type", "")).strip().lower()
+    value    = str(row.get("value", "")).strip()
+    if not value:
+        return None
 
+    ts_str = str(row.get("timestamp", "")).strip()
+    ts_local_str = ts_str
+    if ts_str:
+        try:
+            dt = parser.isoparse(ts_str)
+            # Chỉ gán UTC nếu thiếu thông tin timezone
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            # Đổi sang giờ local của server
+            ts_local_str = dt.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+        except Exception:
+            pass
 
+    src = str(row.get("src_ip", "")).strip()
+    # chỉ giữ src_ip + ts, bỏ session
+    comment = fmt_comment(src, None, ts_local_str)
+
+    # Hash
+    if ioc_type == "hash":
+        htype = classify_hash(value)
+        if not htype:
+            return None
+        return (htype, "Payload delivery", True, value, comment, False)
+
+    # IP
+    elif ioc_type == "ip":
+        is_private = is_non_routable_ip(value)
+        to_ids = not (DISABLE_IDS_FOR_PRIVATE and is_private)
+        if is_private:
+            comment = (comment + "; non-routable") if comment else "non-routable"
+        return ("ip-src", "Network activity", to_ids, value, comment, is_private)
+
+    # Domain / URL / Hostname
+    elif ioc_type in ("domain", "url", "hostname"):
+        misp_type, category, to_ids = MAPPING_BASE[ioc_type]
+        return (misp_type, category, to_ids, value, comment, False)
+
+    # Credential
+    elif ioc_type == "credential":
+        misp_type, category, to_ids = MAPPING_BASE[ioc_type]
+        return (misp_type, category, to_ids, value, comment, False)
+
+    else:
+        return None
+
+# Tạo event đơn lẻ và đẩy danh sách IP.
+def create_single_event_and_push_ips(misp: PyMISP, title: str, ip_list: list[str], comment: str = "") -> str:
+    """Tạo event mới với 'title' và add các ip-src; trả về event_id."""
+    ev = MISPEvent()
+    ev.info            = title
+    ev.distribution    = EVENT_DISTRIBUTION
+    ev.analysis        = EVENT_ANALYSIS
+    ev.threat_level_id = THREAT_LEVEL_ID
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
+
+    event_id = None
+    try:
+        event_id = res["Event"]["id"]
+    except Exception:
+        event_id = getattr(res, "id", None)
+
+    event_id = str(event_id)
+    for ip in ip_list:
+        attr = {
+            "type": "ip-src",
+            "category": "Network activity",
+            "value": ip,
+            "to_ids": True,
+            "comment": comment or "Detected by heuristic",
+        }
+        with_retry(lambda: misp.add_attribute(event_id, attr, pythonify=True), who="misp.add_attr_detection")
+        logger.info(f"[detect] {title}: ADD ip-src {ip} -> event {event_id}")
+    return event_id
+
+ # Sinh tiêu đề event theo prefix + ngày.
+def create_daily_event_title():
+    """Tạo tiêu đề event theo prefix + EVENT_TITLE_FORMAT (theo giờ local)."""
+    ts = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
+    return f"{EVENT_TITLE_PREFIX} - {ts}"
+
+# Lấy hậu tố thời gian (ngày) cho event.
+def _get_ts_suffix_from_daily() -> str:
+    return create_daily_event_title().split(" - ", 1)[-1]
+
+ # Tạo event mới trên MISP với tiêu đề cho trước.
+def _create_event_with_title(misp: PyMISP, title: str) -> str:
+    ev = MISPEvent()
+    ev.info = title
+    ev.distribution = EVENT_DISTRIBUTION
+    ev.analysis = EVENT_ANALYSIS
+    ev.threat_level_id = THREAT_LEVEL_ID
+    res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_detection")
+    try:
+        ev_id = res["Event"]["id"]
+    except Exception:
+        ev_id = getattr(res, "id", None)
+    ev_id = str(ev_id)
+    if MISP_TAGS:
+        tag_event(misp, ev_id, MISP_TAGS)
+    return ev_id
+
+# Tạo event MISP chung, trả về event_id.
 def create_event(misp: PyMISP, title: str) -> str:
     """Tạo MISP Event mới và trả về event_id."""
     ev = MISPEvent()
@@ -851,7 +869,7 @@ def create_event(misp: PyMISP, title: str) -> str:
     return str(event_id)
 
 
-
+# Lấy hoặc tạo event chính (theo DAILY hoặc APPEND mode).
 def get_event_id(misp: PyMISP, ts_suffix: str | None = None):
     suffix = ts_suffix or datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
     today_title = f"{EVENT_TITLE_PREFIX} - {suffix}"
@@ -895,8 +913,7 @@ def get_event_id(misp: PyMISP, ts_suffix: str | None = None):
 
     raise ValueError(f"EVENT_MODE={EVENT_MODE} không hợp lệ")
 
-
-
+ # Đẩy IoC từ DataFrame vào event MISP (check trùng, gắn tag).
 def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
     """Đẩy các IoC trong DataFrame vào MISP Event (check trùng, tag IP private nếu cấu hình)."""
     existing = set()
@@ -948,8 +965,9 @@ def push_iocs_to_misp(misp: PyMISP, event_id: str, df: pd.DataFrame):
 
     return added, skipped
 
-
 # ===== main =====
+
+ # Hàm chính: lấy IoC từ ES, tạo event MISP, chạy detection (Nmap/DDoS/Botnet).
 
 def main():
     if not VERIFY_SSL:
@@ -1064,3 +1082,9 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
+
