@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 from dateutil import parser
-
+import config
 import pandas as pd
 from elasticsearch import Elasticsearch
 from pymisp import PyMISP, MISPEvent
