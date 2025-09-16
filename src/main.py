@@ -16,6 +16,7 @@
 import os
 import re
 import sys
+import socket
 import ipaddress
 import logging
 from logging.handlers import RotatingFileHandler
@@ -63,17 +64,6 @@ from config import (
     # mapping
     MAPPING_BASE
 )
-
-# -----------------------------
-# 2) NẠP ENV & CẤU HÌNH CHUNG
-# -----------------------------
-# .env (tùy chọn)
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
 
 # -----------------------------
 # 3) LOGGER XOAY VÒNG
@@ -936,7 +926,6 @@ def main():
 
         # Trước khi tạo các event Nmap/DDoS, cố gắng lấy sessions từ Cowrie để map IP->session
         sessions = {}
-        ip2sess = {}
         if DETECT_BOTNET:
             try:
                 cowrie_events = fetch_cowrie_events()
