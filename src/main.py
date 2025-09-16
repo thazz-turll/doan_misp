@@ -74,6 +74,12 @@ from ioc_utils import (
 )
 
 
+from es_utils import (
+    es_client, time_range_clause,
+    fetch_iocs_from_es, fetch_conn_tuples_from_es, fetch_cowrie_events
+)
+
+
 # ========================
 # 2. Helpers chung
 # ========================
