@@ -28,7 +28,7 @@ from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-)
+
 from logger import get_logger
 
 logger = get_logger("misp-utils")
