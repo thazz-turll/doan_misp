@@ -11,7 +11,11 @@ from datetime import datetime, timezone
 from dateutil.relativedelta import relativedelta
 import pandas as pd
 from elasticsearch import Elasticsearch
-from config import ES_URL, ES_INDEX, HOURS_LOOKBACK, ES_SOURCE_FIELDS
+
+from ioc_utils import first, many, classify_hash, normalize_url, normalize_domain
+from config import URL_RE, LABELED_HASH_RE, BARE_HASH_RE, DOMAIN_RE
+from misp_utils import with_retry 
+
 from logger import get_logger
 
 logger = get_logger("es-utils")
@@ -32,7 +36,7 @@ def time_range_clause(hours: int):
 def fetch_iocs_from_es():
     """Truy vấn ES, trích IoC (dedupe), trả về DataFrame(các IoC)."""
     # ES client
-    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
+    es = es_client()
     esq = es.options(request_timeout=60)
     now = datetime.now(timezone.utc)
     start = (now - relativedelta(hours=HOURS_LOOKBACK)).isoformat()
@@ -167,7 +171,7 @@ def fetch_conn_tuples_from_es():
     """
     Lấy (src_ip, dst_port) trong khoảng HOURS_LOOKBACK để phục vụ heuristics Nmap/DDoS.
     """
-    es = Elasticsearch([ES_URL], http_compress=True, retry_on_timeout=True, max_retries=5)
+    es = es_client()
     esq = es.options(request_timeout=60)
 
     now = datetime.now(timezone.utc)
