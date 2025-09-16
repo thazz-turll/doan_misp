@@ -17,17 +17,17 @@ import socket
 from urllib.parse import urlparse
 from datetime import datetime, timezone
 
-from ..logger import get_logger
+from logger import get_logger
 from pymisp import MISPEvent
 
-from ..config import (
+from config import (
     URL_RGX, LOGIN_SUCC_RGX, IP_HOST_RGX,
     ALLOW_SAMPLE_FETCH, SAMPLE_MAX_BYTES, EVENT_TITLE_BOTNET,
     VERIFY_SSL, EVENT_DISTRIBUTION, EVENT_ANALYSIS, THREAT_LEVEL_ID,
     MISP_TAGS, SAFE_IPS,
 )
-from ..ioc_utils import fmt_comment
-from ..misp_utils import add_attr_safe, tag_event, with_retry, _get_ts_suffix_from_daily
+from ioc_utils import fmt_comment
+from misp_utils import add_attr_safe, tag_event, with_retry, _get_ts_suffix_from_daily
 
 logger = get_logger("detect-botnet")
 
