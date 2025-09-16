@@ -624,7 +624,8 @@ def map_row_to_misp(row):
             pass
 
     src = str(row.get("src_ip", "")).strip()
-    comment = fmt_comment(src, f"ioc-{src}", ts_local_str)
+    # chỉ giữ src_ip + ts, bỏ session
+    comment = fmt_comment(src, None, ts_local_str)
 
     # Hash
     if ioc_type == "hash":
