@@ -2,10 +2,10 @@
 # -*- coding: utf-8 -*-
 
 
-from ..logger import get_logger
-from ..config import SAFE_IPS, EVENT_TITLE_NMAP
-from ..ioc_utils import fmt_comment          # comment builder
-from ..misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment, _get_ts_suffix_from_daily
+from logger import get_logger
+from config import SAFE_IPS, EVENT_TITLE_NMAP
+from ioc_utils import fmt_comment          # comment builder
+from misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment, _get_ts_suffix_from_daily
 from datetime import datetime, timezone
 import pandas as pd
 logger = get_logger("detect-nmap")
