@@ -27,7 +27,7 @@ from config import (
     MISP_TAGS, SAFE_IPS,
 )
 from ioc_utils import fmt_comment
-from misp_utils import add_attr_safe, tag_event, with_retry
+from misp_utils import add_attr_safe, tag_event, with_retry, _get_ts_suffix_from_daily
 
 logger = get_logger("detect-botnet")
 
