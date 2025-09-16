@@ -85,7 +85,7 @@ from es_utils import (
 from misp_utils import (
     with_retry, add_attr_safe, tag_event,
     create_event, get_event_id, push_iocs_to_misp,
-    create_single_event_and_push_ips, create_daily_event_title
+    create_single_event_and_push_ips, create_daily_event_title, _get_ts_suffix_from_daily
 )
 
 from nmap import (
