@@ -13,7 +13,36 @@ Orchestrator chính:
 from datetime import datetime
 from pymisp import PyMISP
 
-import config
+from config import (
+    # bắt buộc
+    ES_URL, MISP_URL, MISP_KEY,
+    # tùy chọn
+    ES_INDEX, HOURS_LOOKBACK,
+    VERIFY_SSL, EVENT_MODE, MISP_EVENT_ID,
+    EVENT_TITLE_PREFIX, EVENT_TITLE_FORMAT,
+    EVENT_DISTRIBUTION, EVENT_ANALYSIS, THREAT_LEVEL_ID,
+    MISP_TAGS,
+    DISABLE_IDS_FOR_PRIVATE, TAG_PRIVATE_IP_ATTR, PRIVATE_IP_TAG,
+    # logging
+    LOG_FILE, LOG_MAX_BYTES, LOG_BACKUPS,
+    # retry
+    RETRY_BASE, RETRY_CAP, RETRY_MAX,
+    # detection flags
+    ALLOW_SAMPLE_FETCH, SAMPLE_MAX_BYTES,
+    DETECT_NMAP, DETECT_DDOS, DETECT_BOTNET,
+    NMAP_THRESHOLD, DDOS_THRESHOLD,
+    EVENT_TITLE_NMAP, EVENT_TITLE_DDOS, EVENT_TITLE_BOTNET,
+    SAFE_IPS,
+    # ES fields
+    ES_SOURCE_FIELDS,
+    # regex
+    MD5_RE, SHA1_RE, SHA256_RE, SHA512_RE,
+    URL_RGX, LOGIN_SUCC_RGX, IP_HOST_RGX,
+    LABELED_HASH_RE, BARE_HASH_RE, URL_RE,
+    DOMAIN_RE,
+    # mapping
+    MAPPING_BASE
+)
 from logger import get_logger
 
 # utils modules (khung bạn đã tạo)
