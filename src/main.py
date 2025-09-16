@@ -65,7 +65,7 @@ from config import (
     MAPPING_BASE
 )
 
-import logger from get_logger
+from logger import get_logger
 logger = get_logger("ioc-es-misp-v3")
 
 
