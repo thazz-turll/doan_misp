@@ -65,14 +65,10 @@ from config import (
     MAPPING_BASE
 )
 
-# -----------------------------
-# 3) LOGGER XOAY VÒNG
-# -----------------------------
-logger = logging.getLogger("ioc-es-misp-v3")
-logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-logger.addHandler(handler)
+import logger from get_logger
+logger = get_logger("ioc-es-misp-v3")
+
+
 
 # ========================
 # 2. Helpers chung
@@ -524,14 +520,14 @@ def safe_fetch_sha256(url):
                 if not chunk: continue
                 total += len(chunk)
                 if total > SAMPLE_MAX_BYTES:
-                    logging.getLogger("botnet-detect").warning(
+                    get_logger("botnet-detect").warning(
                         f"Sample too large > {SAMPLE_MAX_BYTES} bytes: {url}"
                     )
                     return None
                 h.update(chunk)
             return h.hexdigest()
     except Exception as e:
-        logging.getLogger("botnet-detect").warning(f"safe_fetch_sha256 failed for {url}: {e}")
+        get_logger("botnet-detect").warning(f"safe_fetch_sha256 failed for {url}: {e}")
         return None
 
 # Gom log Cowrie theo session (src_ip, creds, URL, download).
@@ -586,7 +582,7 @@ def create_botnet_event_and_push(misp, sessions):
     res = with_retry(lambda: misp.add_event(ev), who="misp.add_event_botnet")
     event_id = str(res["Event"]["id"])
 
-    logger = logging.getLogger("botnet-detect")
+    logger = get_logger("botnet-detect")
     logger.info(f"[Botnet] Created MISP event id={event_id} title='{title}'")
 
     # Gắn tag như event chính (nếu có)
