@@ -8,17 +8,26 @@ Các hàm hỗ trợ tương tác với MISP: tạo event, thêm attribute,
 retry an toàn, gắn tag, push IoC.
 """
 
-import time
-import random
+import os
+import re
+import sys
+import ipaddress
+import logging
+from logging.handlers import RotatingFileHandler
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+from dateutil.relativedelta import relativedelta
+from dateutil import parser
+
+import pandas as pd
+from elasticsearch import Elasticsearch
 from pymisp import PyMISP, MISPEvent
+import time, random
 from requests.exceptions import RequestException
 from elasticsearch import TransportError, ConnectionError as ESConnectionError
-from datetime import datetime, timezone
-from config import (
-    RETRY_BASE, RETRY_CAP, RETRY_MAX,
-    EVENT_DISTRIBUTION, EVENT_ANALYSIS, THREAT_LEVEL_ID,
-    MISP_TAGS, PRIVATE_IP_TAG, TAG_PRIVATE_IP_ATTR,
-    DISABLE_IDS_FOR_PRIVATE, EVENT_TITLE_PREFIX, EVENT_TITLE_FORMAT
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 )
 from logger import get_logger
 
