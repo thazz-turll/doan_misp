@@ -84,20 +84,6 @@ handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
 logger.addHandler(handler)
 
-
-
-#Elasticsearch IoC Fetch
-ES_SOURCE_FIELDS = [
-    "@timestamp",
-    "source.ip","src_ip",
-    "user.name","username","password",
-    "md5","sha1","sha256","sha512","hash","hashes","message",
-
-    # URL & domain (bao phủ phổ biến)
-    "url","http.url","url.full","url.original","url.domain",
-    "http.hostname","hostname","domain",
-]
-
 # ========================
 # 2. Helpers chung
 # ========================
