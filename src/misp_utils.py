@@ -57,7 +57,7 @@ from config import (
     # mapping
     MAPPING_BASE
 )
-
+from ioc_utils import map_row_to_misp
 
 
 from logger import get_logger
