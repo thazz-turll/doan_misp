@@ -13,7 +13,7 @@ from dateutil import parser
 from datetime import timezone
 from config import (
     MD5_RE, SHA1_RE, SHA256_RE, SHA512_RE,
-    MAPPING_BASE
+    MAPPING_BASE, DISABLE_IDS_FOR_PRIVATE 
 )
 from logger import get_logger
 
