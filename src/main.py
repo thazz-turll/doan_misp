@@ -31,14 +31,8 @@ import time, random
 from requests.exceptions import RequestException
 from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# -----------------------------
-logger = logging.getLogger("ioc-es-misp-v3")
-logger.setLevel(logging.INFO)
-handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
-handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-logger.addHandler(handler)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 from config import (
     # bắt buộc
@@ -70,6 +64,11 @@ from config import (
     # mapping
     MAPPING_BASE
 )
+logger = logging.getLogger("ioc-es-misp-v3")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(handler)
 
 
 from ioc_utils import (
