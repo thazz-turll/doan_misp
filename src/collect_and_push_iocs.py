@@ -601,26 +601,6 @@ def correlate_cowrie_sessions(events):
         sessions[k]["urls"] = list(sessions[k]["urls"])
     return sessions
 
-
-
-def ip_to_first_session(sessions: dict[str, dict]) -> dict[str, str]:
-    """
-    Chọn session sớm nhất (ts_first nhỏ nhất) cho mỗi src_ip.
-    """
-    by_ip = {}
-    for sid, info in sessions.items():
-        ip = info.get("src_ip")
-        ts = info.get("ts_first") or ""
-        if not ip:
-            continue
-        best = by_ip.get(ip)
-        if best is None or (ts and ts < best[0]):
-            by_ip[ip] = (ts, sid)
-    # trả về map ip -> sid
-    return {ip: t_sid[1] for ip, t_sid in by_ip.items()}
-
-
-
 # ===== MISP mapping / push =====
 
 def map_row_to_misp(row):
@@ -727,27 +707,30 @@ def _create_event_with_title(misp: PyMISP, title: str) -> str:
         tag_event(misp, ev_id, MISP_TAGS)
     return ev_id
 
-def create_nmap_event_and_push(misp, ip_list, ip2sess: dict[str, str] | None = None):
+def create_nmap_event_and_push(misp, ip_list):
+    """Tạo event Nmap và push IP (không ghi session vào comment)."""
     title = f"{EVENT_TITLE_NMAP} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
         if ip in SAFE_IPS:
             continue
-        sid = ip2sess.get(ip) if ip2sess else None
-        cmt = fmt_comment(ip, sid, ts_local)
+        # comment chỉ gồm src_ip + ts
+        cmt = fmt_comment(ip, None, ts_local)
         add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
     return ev_id
 
-def create_ddos_event_and_push(misp, ip_list, ip2sess: dict[str, str] | None = None):
+
+def create_ddos_event_and_push(misp, ip_list):
+    """Tạo event DDoS và push IP (không ghi session vào comment)."""
     title = f"{EVENT_TITLE_DDOS} - {_get_ts_suffix_from_daily()}"
     ev_id = _create_event_with_title(misp, title)
     ts_local = _fmt_local_ts_for_comment()
     for ip in ip_list:
         if ip in SAFE_IPS:
             continue
-        sid = ip2sess.get(ip) if ip2sess else None
-        cmt = fmt_comment(ip, sid, ts_local)
+        # comment chỉ gồm src_ip + ts
+        cmt = fmt_comment(ip, None, ts_local)
         add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
     return ev_id
 
@@ -1032,7 +1015,7 @@ def main():
                 suspects_nmap = detect_nmap_scanners(conns, NMAP_THRESHOLD)
                 if suspects_nmap:
                     # truyền ip2sess để comment có session nếu có
-                    ev_nmap = create_nmap_event_and_push(misp, suspects_nmap, ip2sess)
+                    ev_nmap = create_nmap_event_and_push(misp, suspects_nmap)
                     print(f"[+] Created Nmap event: {ev_nmap} ({len(suspects_nmap)} IP)")
             except Exception as e:
                 logger.error(f"Nmap detection failed: {e}")
@@ -1042,7 +1025,7 @@ def main():
             try:
                 suspects_ddos = detect_ddos_sources(conns, DDOS_THRESHOLD)
                 if suspects_ddos:
-                    ev_ddos = create_ddos_event_and_push(misp, suspects_ddos, ip2sess)
+                    ev_ddos = create_ddos_event_and_push(misp, suspects_ddos)
                     print(f"[+] Created DDoS event: {ev_ddos} ({len(suspects_ddos)} IP)")
             except Exception as e:
                 logger.error(f"DDoS detection failed: {e}")
