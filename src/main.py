@@ -45,15 +45,64 @@ from config import (
 )
 from logger import get_logger
 
-# utils modules (khung bạn đã tạo)
-import es_utils
-import ioc_utils
-import misp_utils
+# es_utils: kết nối + fetch từ ES
+from es_utils import (
+    es_client,
+    time_range_clause,
+    fetch_iocs_from_es,
+    fetch_conn_tuples_from_es,
+    fetch_cowrie_events,
+)
 
-# detection modules (khung)
-import nmap
-import ddos
-import botnet
+# ioc_utils: xử lý IoC / chuẩn hoá / mapping
+from ioc_utils import (
+    first,
+    many,
+    classify_hash,
+    is_non_routable_ip,
+    normalize_domain,
+    normalize_url,
+    fmt_comment,
+    map_row_to_misp,
+)
+
+# misp_utils: tương tác với MISP (retry, tạo event, push IoC)
+from misp_utils import (
+    _is_retryable_exc,
+    with_retry,
+    add_attr_safe,
+    tag_event,
+    create_event,
+    _create_event_with_title,
+    get_event_id,
+    push_iocs_to_misp,
+    create_single_event_and_push_ips,
+    create_daily_event_title,
+    _get_ts_suffix_from_daily as misp__get_ts_suffix,  # optional alias
+)
+
+# detection modules (Nmap / DDoS / Botnet) — import các hàm detect + create
+from nmap import (
+    detect_nmap_scanners,
+    create_nmap_event_and_push,
+    # _get_ts_suffix_from_daily  # see note about collisions below
+)
+
+from ddos import (
+    detect_ddos_sources,
+    create_ddos_event_and_push,
+    # _get_ts_suffix_from_daily
+)
+
+from botnet import (
+    extract_urls_from_command,
+    resolve_ip,
+    safe_fetch_sha256,
+    correlate_cowrie_sessions,
+    create_botnet_event_and_push,
+    # _get_ts_suffix_from_daily
+)
+
 
 logger = get_logger("main")
 
