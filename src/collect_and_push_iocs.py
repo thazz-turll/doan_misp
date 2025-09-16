@@ -1004,7 +1004,6 @@ def main():
                 cowrie_events = fetch_cowrie_events()
                 if cowrie_events:
                     sessions = correlate_cowrie_sessions(cowrie_events)
-                    ip2sess = ip_to_first_session(sessions)
                 else:
                     logger.info("[Botnet] Không lấy được cowrie events (rỗng).")
             except Exception as e:
