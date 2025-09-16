@@ -305,3 +305,10 @@ def create_daily_event_title():
 # Lấy hậu tố thời gian (ngày) cho event.
 def _get_ts_suffix_from_daily() -> str:
     return create_daily_event_title().split(" - ", 1)[-1]
+# Lấy timestamp local để chèn vào comment MISP.
+def _fmt_local_ts_for_comment() -> str:
+    """Trả về timestamp local kiểu 'YYYY-MM-DD HH:MM:SS +07'."""
+    d = datetime.now().astimezone()
+    tz_raw = d.strftime("%z")  # ví dụ +0700
+    tz_short = tz_raw[:3] if tz_raw else ""
+    return d.strftime("%Y-%m-%d %H:%M:%S") + (f" {tz_short}" if tz_short else "")
