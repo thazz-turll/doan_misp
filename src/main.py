@@ -110,7 +110,6 @@ def main():
     # Cho toàn bộ helper dùng CÙNG một suffix (Nmap/DDoS/Botnet)
     def _fixed_suffix() -> str:
         return ts_suffix
-    global _get_ts_suffix_from_daily
     _get_ts_suffix_from_daily = _fixed_suffix
 
     # 1) Lấy IoC từ ES (dùng để push vào event chính)
