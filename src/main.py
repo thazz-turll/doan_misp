@@ -33,6 +33,13 @@ from elasticsearch import TransportError, ConnectionError as ESConnectionError
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# -----------------------------
+logger = logging.getLogger("ioc-es-misp-v3")
+logger.setLevel(logging.INFO)
+handler = RotatingFileHandler(LOG_FILE, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8")
+handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
+logger.addHandler(handler)
+
 from config import (
     # bắt buộc
     ES_URL, MISP_URL, MISP_KEY,
@@ -64,9 +71,6 @@ from config import (
     MAPPING_BASE
 )
 
-from logger import get_logger
-logger = get_logger("ioc-es-misp-v3")
-
 
 from ioc_utils import (
     first, many, classify_hash, is_non_routable_ip,
@@ -79,20 +83,11 @@ from es_utils import (
     fetch_iocs_from_es, fetch_conn_tuples_from_es, fetch_cowrie_events
 )
 
-
-import misp_utils as MU  # để override _get_ts_suffix_from_daily
 from misp_utils import (
     with_retry, add_attr_safe, tag_event,
     create_event, get_event_id, push_iocs_to_misp,
     create_single_event_and_push_ips, create_daily_event_title
 )
-
-ts_suffix = datetime.now().astimezone().strftime(EVENT_TITLE_FORMAT)
-
-def _fixed_suffix() -> str:
-    return ts_suffix
-
-MU._get_ts_suffix_from_daily = _fixed_suffix
 
 from nmap import (
      detect_nmap_scanners, create_nmap_event_and_push
@@ -104,6 +99,8 @@ from botnet import (
      correlate_cowrie_sessions,
      create_botnet_event_and_push
 )
+ # Hàm chính: lấy IoC từ ES, tạo event MISP, chạy detection (Nmap/DDoS/Botnet).
+
 def main():
     if not VERIFY_SSL:
         logger.warning("MISP SSL verification DISABLED (lab only)")
@@ -151,6 +148,7 @@ def main():
 
         # Trước khi tạo các event Nmap/DDoS, cố gắng lấy sessions từ Cowrie để map IP->session
         sessions = {}
+        ip2sess = {}
         if DETECT_BOTNET:
             try:
                 cowrie_events = fetch_cowrie_events()
