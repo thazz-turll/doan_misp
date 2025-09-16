@@ -12,7 +12,7 @@ Kịch bản phát hiện DDoS:
 from logger import get_logger
 from config import SAFE_IPS, EVENT_TITLE_DDOS
 from ioc_utils import fmt_comment
-from misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment
+from misp_utils import _create_event_with_title, add_attr_safe, create_daily_event_title, _fmt_local_ts_for_comment, _get_ts_suffix_from_daily
 from datetime import datetime, timezone
 import pandas as pd
 
@@ -40,6 +40,4 @@ def create_ddos_event_and_push(misp, ip_list):
         cmt = fmt_comment(ip, None, ts_local)
         add_attr_safe(misp, ev_id, "ip-src", ip, "Network activity", cmt, True)
     return ev_id
-# Lấy hậu tố thời gian (ngày) cho event.
-def _get_ts_suffix_from_daily() -> str:
-    return create_daily_event_title().split(" - ", 1)[-1]
+
