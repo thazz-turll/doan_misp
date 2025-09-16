@@ -13,7 +13,7 @@ import pandas as pd
 from elasticsearch import Elasticsearch
 
 from ioc_utils import first, many, classify_hash, normalize_url, normalize_domain
-from config import URL_RE, LABELED_HASH_RE, BARE_HASH_RE, DOMAIN_RE
+from config import URL_RE, LABELED_HASH_RE, BARE_HASH_RE, DOMAIN_RE, ES_URL, ES_INDEX, HOURS_LOOKBACK, ES_SOURCE_FIELDS
 from misp_utils import with_retry 
 
 from logger import get_logger
