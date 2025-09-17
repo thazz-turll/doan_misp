@@ -313,6 +313,3 @@ def _fmt_local_ts_for_comment() -> str:
     tz_short = tz_raw[:3] if tz_raw else ""
     return d.strftime("%Y-%m-%d %H:%M:%S") + (f" {tz_short}" if tz_short else "")
 
-# Lấy hậu tố thời gian (ngày) cho event.
-def _get_ts_suffix_from_daily() -> str:
-    return create_daily_event_title().split(" - ", 1)[-1]
